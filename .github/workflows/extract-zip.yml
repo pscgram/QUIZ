@@ -1,5 +1,5 @@
 
-name: Extract PSCGram ZIP
+name: Extract PSCGram Quizbot ZIP
 
 on:
   workflow_dispatch:
@@ -12,24 +12,105 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      # 1. Download repository
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
+      # 2. Install extraction tools
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y unzip rsync
+
+      # 3. Check ZIP file
+      - name: Check ZIP file
+        run: |
+          if [ ! -f "PSCGram_Quizbot_Render_Ready.zip" ]; then
+            echo "ERROR: ZIP file not found in repository root."
+            ls -la
+            exit 1
+          fi
+
+          echo "ZIP file found successfully."
+
+      # 4. Extract ZIP
       - name: Extract ZIP
         run: |
-          mkdir -p extracted
-          unzip -o PSCGram_Quizbot_Render_Ready.zip -d extracted
+          mkdir -p "$RUNNER_TEMP/pscgram-extract"
 
-      - name: Copy project files to root
+          unzip -o \
+            PSCGram_Quizbot_Render_Ready.zip \
+            -d "$RUNNER_TEMP/pscgram-extract"
+
+          echo "ZIP extraction completed."
+
+      # 5. Locate actual project folder
+      - name: Locate project folder
         run: |
-          cp -a extracted/PSCGram_Quizbot_Render_Ready/. .
-          rm -rf extracted
+          PROJECT_DIR=$(dirname "$(find "$RUNNER_TEMP/pscgram-extract" \
+            -type f -name Dockerfile -print -quit)")
+
+          if [ -z "$PROJECT_DIR" ] || [ ! -f "$PROJECT_DIR/run.py" ]; then
+            echo "ERROR: Cannot locate valid Quizbot project."
+            exit 1
+          fi
+
+          if [ ! -d "$PROJECT_DIR/quizbot" ]; then
+            echo "ERROR: quizbot folder missing."
+            exit 1
+          fi
+
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+
+          echo "Project folder located successfully."
+
+      # 6. Copy project files
+      # Exclude original GitHub workflows to avoid
+      # requiring the special workflows permission.
+      - name: Copy project files
+        run: |
+          rsync -a \
+            --exclude='.github/' \
+            --exclude='.git/' \
+            "$PROJECT_DIR/" "$GITHUB_WORKSPACE/"
+
+          echo "Project files copied successfully."
+
+      # 7. Remove uploaded ZIP
+      - name: Remove ZIP archive
+        run: |
           rm -f PSCGram_Quizbot_Render_Ready.zip
 
-      - name: Commit extracted files
+      # 8. Verify project structure
+      - name: Verify project
+        run: |
+          test -f Dockerfile
+          test -f Procfile
+          test -f render.yaml
+          test -f requirements.txt
+          test -f run.py
+          test -d quizbot
+
+          echo "All required project files found."
+
+      # 9. Commit and push extracted files
+      - name: Commit and push
         run: |
           git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git config user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+
           git add -A
-          git commit -m "Extract PSCGram Quizbot project" || echo "No changes"
-          git push
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "Extract PSCGram Quizbot project"
+
+            git push origin "HEAD:${GITHUB_REF_NAME}"
+          fi
+
+          echo "PSCGram extraction workflow completed."
