@@ -1,7 +1,9 @@
 """
-PSCGram QuizBot — Creator Bot Rate Limiter
-Owner gets unlimited access.
-Normal users keep the existing rate limits.
+Advance Quiz Bot — Open Source Project
+Creator Bot rate limiter.
+
+Owner (OWNER_ID) has unlimited access.
+All other users keep the existing rate limits.
 """
 
 from __future__ import annotations
@@ -34,16 +36,18 @@ def ratelimit(bucket: str = "default") -> Callable[[Handler], Handler]:
             # ============================================================
             # OWNER BYPASS
             # ============================================================
-            # The Telegram user whose numeric ID is in OWNER_ID gets
-            # unlimited access to all rate-limited commands.
+            # If this Telegram user is the configured OWNER_ID,
+            # completely bypass all Creator Bot rate limits.
             #
-            # This bypasses:
+            # Owner gets unlimited:
             #   - General commands
-            #   - /create + /done
-            #   - /myquizzes + /edit
+            #   - /create
+            #   - /done
+            #   - /myquizzes
+            #   - /edit
             # ============================================================
 
-            if config.OWNER_ID and user.id == config.OWNER_ID:
+            if config.OWNER_ID is not None and user.id == config.OWNER_ID:
                 return await fn(client, message, *args, **kwargs)
 
             # ============================================================
@@ -68,7 +72,7 @@ def ratelimit(bucket: str = "default") -> Callable[[Handler], Handler]:
             except Exception:
                 logger.debug(
                     "Failed to send rate-limit notice",
-                    exc_info=True
+                    exc_info=True,
                 )
 
             return None
