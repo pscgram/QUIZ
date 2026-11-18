@@ -7,6 +7,7 @@ Supports:
 - Quiz poll importing
 - TXT / JSON importing
 - DIRECT PDF -> MCQ -> QUIZ
+- English + Malayalam OCR through file_import.py
 - No AI required for PDF parsing
 """
 
@@ -52,6 +53,11 @@ logger = logging.getLogger(__name__)
 MIN_QUESTIONS = 10
 MAX_QUESTIONS = 300
 MAX_QUESTIONS_OWNER = 3000
+
+# IMPORTANT:
+# The Creator Bot creates/manages quizzes.
+# The Runner Bot opens/plays the quizzes.
+RUNNER_BOT_USERNAME = "Quizpscbot"
 
 
 _RESERVED_COMMANDS = [
@@ -512,15 +518,26 @@ async def _finalize_quiz(
 
     me = await c.get_me()
 
+    # IMPORTANT:
+    # Play/Add-to-Group links point to Runner Bot.
+    # Creator Bot is only used for creating/managing quizzes.
+
+    quiz_url = (
+        f"https://t.me/{RUNNER_BOT_USERNAME}?start={qid}"
+    )
+
+    # Telegram's native share URL.
+    share_url = (
+        "https://t.me/share/url"
+        f"?url={quiz_url}"
+        f"&text={quiz_name}"
+    )
+
     kb_buttons = [
         [
             InlineKeyboardButton(
-                "🚀 Start",
-                url=(
-                    f"https://t.me/"
-                    f"{me.username}"
-                    f"?start={qid}"
-                ),
+                "🚀 Start Quiz",
+                url=quiz_url,
             )
         ],
         [
@@ -528,19 +545,21 @@ async def _finalize_quiz(
                 "👥 Add to Group",
                 url=(
                     f"https://t.me/"
-                    f"{me.username}"
+                    f"{RUNNER_BOT_USERNAME}"
                     f"?startgroup={qid}"
                 ),
             )
         ],
         [
             InlineKeyboardButton(
-                "🔗 Share",
-                switch_inline_query=qid,
+                "🔗 Share Quiz",
+                url=share_url,
             )
         ],
     ]
 
+    # Mini App buttons still use the Creator Bot's
+    # existing Mini App configuration.
     play_practice = (
         mini_app_web_app_button(
             me.username,
@@ -886,7 +905,6 @@ async def handle_pdf_direct(
         questions = await process_uploaded_file(
             content,
             filename,
-            mime_type,
             max_questions=(
                 MAX_QUESTIONS_OWNER
                 if uid == config.OWNER_ID
@@ -915,14 +933,18 @@ async def handle_pdf_direct(
 
         await status.edit_text(
             "❌ **No MCQs found in this PDF.**\n\n"
-            "The PDF must contain text-based questions in a format such as:\n\n"
+            "The PDF should contain questions and options "
+            "in a recognizable MCQ format.\n\n"
+            "Example:\n\n"
             "1. Question?\n"
             "A) Option 1\n"
             "B) Option 2\n"
             "C) Option 3\n"
             "D) Option 4\n"
             "ANSWER: A\n\n"
-            "⚠️ Scanned/image-only PDFs are not supported yet."
+            "🔎 The bot automatically tries "
+            "English + Malayalam OCR for "
+            "scanned/image-based PDFs."
         )
 
         return
@@ -935,8 +957,8 @@ async def handle_pdf_direct(
 
         await status.edit_text(
             f"⚠️ Only **{len(questions)} MCQs** were found.\n\n"
-            f"At least **{MIN_QUESTIONS} questions** are required "
-            "to create a quiz."
+            f"At least **{MIN_QUESTIONS} questions** "
+            f"are required to create a quiz."
         )
 
         return
@@ -978,10 +1000,10 @@ async def handle_pdf_direct(
     # AUTOMATIC QUIZ CREATION
     #
     # Defaults:
-    # type   = free
-    # timer  = 20 sec
-    # promo  = none
-    # section= none
+    # type    = free
+    # timer   = 20 sec
+    # promo   = none
+    # section = none
     # --------------------------------------------------------
 
     await status.edit_text(
@@ -1146,7 +1168,6 @@ async def handle_document(
         parsed = await process_uploaded_file(
             content,
             filename,
-            mime_type,
             max_questions=(
                 MAX_QUESTIONS_OWNER
                 if uid == config.OWNER_ID
