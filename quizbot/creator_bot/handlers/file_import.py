@@ -5,9 +5,10 @@ Supports:
 - TXT
 - JSON
 - Text-based PDF
-- Scanned/image PDF using OCR
+- Scanned/image PDF
 - English OCR
 - Malayalam OCR
+- Malayalam option labels
 - Automatic MCQ extraction
 - No AI required
 """
@@ -28,19 +29,14 @@ logger = logging.getLogger(__name__)
 # ============================================================
 
 def strip_source_noise(text: str) -> str:
-    """Remove common PDF/source noise without changing MCQ content."""
+    """Remove common PDF/source noise without damaging Malayalam."""
 
     if not text:
         return ""
 
-    # Normalize line endings
     text = text.replace("\r\n", "\n").replace("\r", "\n")
-
-    # Remove null characters
     text = text.replace("\x00", "")
-
-    # Remove repeated spaces
-    text = re.sub(r"[ \t]+", " ", text)
+    text = text.replace("\u00a0", " ")
 
     # Remove obvious page-number-only lines
     text = re.sub(
@@ -49,7 +45,6 @@ def strip_source_noise(text: str) -> str:
         text,
     )
 
-    # Remove common PSCGram branding/noise
     noise_patterns = [
         r"(?im)^\s*@psc_?gram\s*$",
         r"(?im)^\s*@pscgram\s*$",
@@ -61,42 +56,157 @@ def strip_source_noise(text: str) -> str:
     for pattern in noise_patterns:
         text = re.sub(pattern, "", text)
 
-    # Remove excessive blank lines
+    # Preserve line breaks.
+    # Only collapse repeated horizontal spaces.
+    text = re.sub(r"[ \t]+", " ", text)
+
     text = re.sub(r"\n{3,}", "\n\n", text)
 
     return text.strip()
 
 
 def filter_words(text: str) -> str:
-    """Clean OCR/PDF text while preserving Malayalam and English."""
+    """
+    Light cleaning only.
+
+    IMPORTANT:
+    Malayalam Unicode must not be stripped.
+    """
 
     if not text:
         return ""
 
-    # Fix common OCR spacing problems
     text = text.replace("\u00a0", " ")
 
-    # Normalize spaces
+    # Normalize unusual whitespace but preserve line structure.
     text = re.sub(r"[ \t]+", " ", text)
-
-    # Normalize blank lines
     text = re.sub(r"\n{3,}", "\n\n", text)
 
     return text.strip()
 
 
 # ============================================================
-# OPTION / ANSWER HELPERS
+# MALAYALAM / ENGLISH OPTION HELPERS
 # ============================================================
 
+# Malayalam MCQ papers commonly use:
+#
+# A / B / C / D
+# എ / ബി / സി / ഡി
+#
+# Sometimes OCR produces:
+# (A), A), A., A:
+# (എ), എ), എ., എ:
+#
+MALAYALAM_OPTION_MAP = {
+    "എ": "A",
+    "ബി": "B",
+    "സി": "C",
+    "ഡി": "D",
+}
+
 OPTION_RE = re.compile(
-    r"^\s*(?:"
+    r"^\s*"
+    r"(?:"
     r"\(?([A-Da-d])\)?"
-    r"[\.\):\-]\s*"
     r"|"
-    r"([A-Da-d])\s+"
-    r")(.+?)\s*$"
+    r"\(?([എബി‌സിഡ])\)?"
+    r")"
+    r"\s*[\.\):\-–—]\s*"
+    r"(.+?)"
+    r"\s*$"
 )
+
+# Also support:
+# A Option
+# B Option
+# എ Option
+OPTION_SPACE_RE = re.compile(
+    r"^\s*"
+    r"(?:"
+    r"([A-Da-d])"
+    r"|"
+    r"([എബി‌സിഡ])"
+    r")"
+    r"\s+"
+    r"(.+?)"
+    r"\s*$"
+)
+
+
+def _normalise_option_letter(letter: str) -> Optional[str]:
+    if not letter:
+        return None
+
+    letter = letter.strip().upper()
+
+    if letter in {"A", "B", "C", "D"}:
+        return letter
+
+    # Malayalam characters
+    for mal, eng in MALAYALAM_OPTION_MAP.items():
+        if letter == mal.upper():
+            return eng
+
+    return None
+
+
+def _extract_option(line: str):
+    """
+    Extract A/B/C/D option.
+
+    Supports:
+
+        A. Option
+        A) Option
+        (A) Option
+        A: Option
+        A - Option
+
+        എ. Option
+        എ) Option
+        (എ) Option
+        എ: Option
+        എ - Option
+
+        A Option
+        എ Option
+    """
+
+    if not line:
+        return None
+
+    line = line.strip()
+
+    match = OPTION_RE.match(line)
+
+    if match:
+        letter = match.group(1) or match.group(2)
+        value = match.group(3)
+
+        letter = _normalise_option_letter(letter)
+
+        if letter and value:
+            return letter, value.strip()
+
+    # Space-separated fallback
+    match = OPTION_SPACE_RE.match(line)
+
+    if match:
+        letter = match.group(1) or match.group(2)
+        value = match.group(3)
+
+        letter = _normalise_option_letter(letter)
+
+        if letter and value:
+            return letter, value.strip()
+
+    return None
+
+
+# ============================================================
+# ANSWER HELPERS
+# ============================================================
 
 ANSWER_RE = re.compile(
     r"^\s*"
@@ -105,51 +215,19 @@ ANSWER_RE = re.compile(
     r"|ans"
     r"|correct\s+answer"
     r"|correct\s+ans"
-    r"|"
-    r"ഉത്തരം"
+    r"|correct"
+    r"|ഉത്തരം"
     r"|ശരിയുത്തരം"
     r"|ശരിയായ\s+ഉത്തരം"
+    r"|ശരി\s*ഉത്തരം"
     r")"
     r"\s*[:\-\.]?\s*"
-    r"[\(\[]?\s*([A-Da-d])\s*[\)\]]?"
+    r"[\(\[]?\s*"
+    r"([A-Da-d]|[എബി‌സിഡ])"
+    r"\s*[\)\]]?"
     r"\s*$",
     re.IGNORECASE,
 )
-
-
-def _extract_option(line: str):
-    """
-    Extract A/B/C/D option.
-
-    Supports:
-        A. Option
-        A) Option
-        (A) Option
-        A: Option
-        A - Option
-    """
-
-    if not line:
-        return None
-
-    match = OPTION_RE.match(line)
-
-    if not match:
-        return None
-
-    letter = match.group(1) or match.group(2)
-    value = match.group(3)
-
-    if not letter or not value:
-        return None
-
-    letter = letter.upper()
-    value = value.strip()
-
-    if letter not in {"A", "B", "C", "D"}:
-        return None
-
-    return letter, value
 
 
 def _extract_answer(line: str):
@@ -158,12 +236,14 @@ def _extract_answer(line: str):
     if not line:
         return None
 
-    match = ANSWER_RE.match(line.strip())
+    line = line.strip()
+
+    match = ANSWER_RE.match(line)
 
     if not match:
         return None
 
-    answer = match.group(1).upper()
+    answer = _normalise_option_letter(match.group(1))
 
     if answer in {"A", "B", "C", "D"}:
         return answer
@@ -175,13 +255,19 @@ def _extract_answer(line: str):
 # QUESTION DETECTION
 # ============================================================
 
+# Examples:
+#
+# 1. Question
+# 1) Question
+# 1: Question
+# Q1. Question
+# Q 1. Question
+#
 QUESTION_RE = re.compile(
     r"^\s*"
-    r"(?:"
-    r"Q(?:uestion)?\s*"
-    r")?"
+    r"(?:Q(?:uestion)?\s*)?"
     r"(\d{1,4})"
-    r"\s*[\.\):\-]\s*"
+    r"\s*[\.\):\-–—]\s*"
     r"(.+?)"
     r"\s*$",
     re.IGNORECASE,
@@ -189,8 +275,6 @@ QUESTION_RE = re.compile(
 
 
 def _is_question_start(line: str) -> bool:
-    """Return True if line looks like a numbered question."""
-
     if not line:
         return False
 
@@ -200,8 +284,6 @@ def _is_question_start(line: str) -> bool:
 
 
 def _extract_question_number(line: str):
-    """Extract question number and text."""
-
     match = QUESTION_RE.match(line.strip())
 
     if not match:
@@ -214,14 +296,75 @@ def _extract_question_number(line: str):
 
 
 # ============================================================
+# OCR LINE REPAIR
+# ============================================================
+
+def _repair_ocr_lines(lines: List[str]) -> List[str]:
+    """
+    Repair common OCR formatting problems.
+
+    Examples:
+
+        1.
+        Question text
+
+    becomes:
+
+        1. Question text
+
+    Also preserves option lines and answer lines.
+    """
+
+    repaired = []
+
+    i = 0
+
+    while i < len(lines):
+
+        line = lines[i].strip()
+
+        if not line:
+            i += 1
+            continue
+
+        # Question number on its own:
+        # 1.
+        # 2)
+        # 10.
+        standalone_q = re.match(
+            r"^\s*(\d{1,4})\s*[\.\):\-–—]\s*$",
+            line,
+        )
+
+        if standalone_q and i + 1 < len(lines):
+
+            next_line = lines[i + 1].strip()
+
+            if next_line:
+                repaired.append(
+                    f"{standalone_q.group(1)}. {next_line}"
+                )
+                i += 2
+                continue
+
+        repaired.append(line)
+
+        i += 1
+
+    return repaired
+
+
+# ============================================================
 # PARSE ONE QUESTION BLOCK
 # ============================================================
 
-def parse_question_block(lines: List[str]) -> Optional[Dict[str, Any]]:
+def parse_question_block(
+    lines: List[str],
+) -> Optional[Dict[str, Any]]:
     """
     Parse one MCQ block.
 
-    Expected structure:
+    Example:
 
     1. Question text
     A. Option one
@@ -230,7 +373,14 @@ def parse_question_block(lines: List[str]) -> Optional[Dict[str, Any]]:
     D. Option four
     ANSWER: A
 
-    Malayalam is also supported.
+    Malayalam:
+
+    1. ചോദ്യം
+    എ. ഓപ്ഷൻ ഒന്ന്
+    ബി. ഓപ്ഷൻ രണ്ട്
+    സി. ഓപ്ഷൻ മൂന്ന്
+    ഡി. ഓപ്ഷൻ നാല്
+    ഉത്തരം: എ
     """
 
     if not lines:
@@ -247,11 +397,18 @@ def parse_question_block(lines: List[str]) -> Optional[Dict[str, Any]]:
     if not cleaned:
         return None
 
+    # Repair OCR formatting
+    cleaned = _repair_ocr_lines(cleaned)
+
+    # --------------------------------------------------------
     # Find question line
+    # --------------------------------------------------------
+
     question_index = None
     question_text = ""
 
     for i, line in enumerate(cleaned):
+
         result = _extract_question_number(line)
 
         if result:
@@ -262,10 +419,15 @@ def parse_question_block(lines: List[str]) -> Optional[Dict[str, Any]]:
     if question_index is None:
         return None
 
-    options = {}
+    options: Dict[str, str] = {}
     answer = None
 
-    # Everything after question line
+    question_continuation = []
+
+    # --------------------------------------------------------
+    # Parse everything after question line
+    # --------------------------------------------------------
+
     for line in cleaned[question_index + 1:]:
 
         # Answer
@@ -283,24 +445,45 @@ def parse_question_block(lines: List[str]) -> Optional[Dict[str, Any]]:
             options[letter] = value
             continue
 
-        # Sometimes the question continues over multiple lines
+        # Before first option, treat as question continuation
         if len(options) == 0:
-            if question_text:
-                question_text += " " + line
+            question_continuation.append(line)
 
-    # Must have four options
+    if question_continuation:
+        question_text = (
+            question_text
+            + " "
+            + " ".join(question_continuation)
+        )
+
+    question_text = re.sub(
+        r"\s+",
+        " ",
+        question_text,
+    ).strip()
+
+    # --------------------------------------------------------
+    # Require four options
+    # --------------------------------------------------------
+
     if not question_text:
         return None
 
-    if not all(letter in options for letter in ["A", "B", "C", "D"]):
+    if not all(
+        letter in options
+        for letter in ["A", "B", "C", "D"]
+    ):
         return None
 
-    # If answer is missing, try to find answer from text
+    # --------------------------------------------------------
+    # Require answer
+    # --------------------------------------------------------
+
     if answer not in {"A", "B", "C", "D"}:
         return None
 
     return {
-        "question": question_text.strip(),
+        "question": question_text,
         "options": [
             options["A"],
             options["B"],
@@ -315,10 +498,10 @@ def parse_question_block(lines: List[str]) -> Optional[Dict[str, Any]]:
 # TEXT MCQ PARSER
 # ============================================================
 
-def _parse_text_mcqs(text: str, max_questions: int = 300) -> List[Dict[str, Any]]:
-    """
-    Parse MCQs from extracted PDF/OCR text.
-    """
+def _parse_text_mcqs(
+    text: str,
+    max_questions: int = 300,
+) -> List[Dict[str, Any]]:
 
     text = strip_source_noise(text)
     text = filter_words(text)
@@ -326,7 +509,12 @@ def _parse_text_mcqs(text: str, max_questions: int = 300) -> List[Dict[str, Any]
     if not text:
         return []
 
-    lines = [line.strip() for line in text.splitlines()]
+    lines = [
+        line.strip()
+        for line in text.splitlines()
+    ]
+
+    lines = _repair_ocr_lines(lines)
 
     blocks = []
     current_block = []
@@ -336,7 +524,6 @@ def _parse_text_mcqs(text: str, max_questions: int = 300) -> List[Dict[str, Any]
         if not line:
             continue
 
-        # New question
         if _is_question_start(line):
 
             if current_block:
@@ -366,7 +553,9 @@ def _parse_text_mcqs(text: str, max_questions: int = 300) -> List[Dict[str, Any]
                 questions.append(question)
 
         except Exception:
-            logger.exception("Error parsing MCQ block")
+            logger.exception(
+                "Error parsing MCQ block"
+            )
 
     return questions
 
@@ -383,19 +572,28 @@ def _extract_pdf_text(pdf_bytes: bytes) -> str:
     document = None
 
     try:
-        document = fitz.open(stream=pdf_bytes, filetype="pdf")
+
+        document = fitz.open(
+            stream=pdf_bytes,
+            filetype="pdf",
+        )
 
         for page in document:
+
             try:
+
                 text = page.get_text("text")
 
                 if text:
                     output.append(text)
 
             except Exception:
-                logger.exception("Failed extracting text from PDF page")
+                logger.exception(
+                    "Failed extracting PDF page text"
+                )
 
     finally:
+
         if document is not None:
             document.close()
 
@@ -403,37 +601,122 @@ def _extract_pdf_text(pdf_bytes: bytes) -> str:
 
 
 # ============================================================
-# OCR
+# IMAGE PREPROCESSING
+# ============================================================
+
+def _prepare_ocr_image(image):
+    """
+    Prepare scanned page for OCR.
+
+    Uses grayscale + contrast enhancement.
+    """
+
+    try:
+
+        from PIL import ImageEnhance, ImageFilter
+
+        # Convert to grayscale
+        image = image.convert("L")
+
+        # Improve contrast
+        image = ImageEnhance.Contrast(
+            image
+        ).enhance(1.8)
+
+        # Slight sharpening
+        image = image.filter(
+            ImageFilter.SHARPEN
+        )
+
+        return image
+
+    except Exception:
+
+        logger.exception(
+            "OCR image preprocessing failed"
+        )
+
+        return image
+
+
+# ============================================================
+# OCR ONE PAGE
+# ============================================================
+
+def _ocr_page(image) -> str:
+    """
+    OCR one page using multiple page segmentation modes.
+
+    We try both modes because Malayalam PDFs can have
+    very different layouts.
+    """
+
+    import pytesseract
+
+    image = _prepare_ocr_image(image)
+
+    results = []
+
+    for psm in (6, 11):
+
+        try:
+
+            text = pytesseract.image_to_string(
+                image,
+                lang="eng+mal",
+                config=f"--oem 3 --psm {psm}",
+            )
+
+            if text and text.strip():
+
+                results.append(text)
+
+        except Exception:
+
+            logger.exception(
+                "Tesseract OCR failed for PSM %s",
+                psm,
+            )
+
+    if not results:
+        return ""
+
+    # Prefer the result containing more useful text.
+    results.sort(
+        key=lambda value: len(value.strip()),
+        reverse=True,
+    )
+
+    return results[0]
+
+
+# ============================================================
+# OCR PDF
 # ============================================================
 
 def _ocr_pdf(
     pdf_bytes: bytes,
-    max_pages: int = 100,
+    max_pages: int = 150,
 ) -> str:
     """
-    OCR scanned PDF pages.
+    OCR scanned PDF.
 
     Languages:
-        eng = English
-        mal = Malayalam
-
-    Requires:
-        tesseract-ocr
-        tesseract-ocr-eng
-        tesseract-ocr-mal
-        pytesseract
-        Pillow
+        English + Malayalam
     """
 
     try:
+
         import pytesseract
         from PIL import Image
 
     except ImportError:
+
         logger.exception(
             "OCR dependencies are missing. "
             "Install pytesseract and Pillow."
         )
+
         return ""
 
     output = []
@@ -441,22 +724,34 @@ def _ocr_pdf(
     document = None
 
     try:
-        document = fitz.open(stream=pdf_bytes, filetype="pdf")
 
-        page_count = min(len(document), max_pages)
+        document = fitz.open(
+            stream=pdf_bytes,
+            filetype="pdf",
+        )
+
+        page_count = min(
+            len(document),
+            max_pages,
+        )
 
         logger.info(
-            "Starting OCR: %s pages, languages=eng+mal",
+            "Starting Malayalam + English OCR: "
+            "%s pages",
             page_count,
         )
 
         for page_number in range(page_count):
 
             try:
+
                 page = document[page_number]
 
-                # Render page at higher resolution for better OCR
-                matrix = fitz.Matrix(2.5, 2.5)
+                # Higher resolution than the old OCR.
+                matrix = fitz.Matrix(
+                    3.0,
+                    3.0,
+                )
 
                 pix = page.get_pixmap(
                     matrix=matrix,
@@ -465,15 +760,14 @@ def _ocr_pdf(
 
                 image = Image.frombytes(
                     "RGB",
-                    [pix.width, pix.height],
+                    [
+                        pix.width,
+                        pix.height,
+                    ],
                     pix.samples,
                 )
 
-                text = pytesseract.image_to_string(
-                    image,
-                    lang="eng+mal",
-                    config="--psm 6",
-                )
+                text = _ocr_page(image)
 
                 if text:
                     output.append(text)
@@ -485,15 +779,20 @@ def _ocr_pdf(
                 )
 
             except Exception:
+
                 logger.exception(
                     "OCR failed on page %s",
                     page_number + 1,
                 )
 
     except Exception:
-        logger.exception("Failed opening PDF for OCR")
+
+        logger.exception(
+            "Failed opening PDF for OCR"
+        )
 
     finally:
+
         if document is not None:
             document.close()
 
@@ -511,62 +810,70 @@ def process_pdf_mcqs(
     """
     Convert PDF bytes into MCQs.
 
-    Processing order:
+    Processing:
 
-    1. Extract normal PDF text.
-    2. Try MCQ parser.
-    3. If insufficient MCQs are found,
-       automatically run English + Malayalam OCR.
-    4. Parse OCR result.
+    1. Normal embedded text extraction.
+    2. Parse normal text.
+    3. OCR PDF using English + Malayalam.
+    4. Parse OCR text.
+    5. Keep whichever extraction produces more valid MCQs.
+
+    OCR is NOT limited to only PDFs with fewer than 10
+    detected questions. This improves scanned Malayalam PDFs
+    where normal extraction may find some but not all questions.
     """
 
     if not content:
         return []
 
     # --------------------------------------------------------
-    # STEP 1: Normal PDF text extraction
+    # Normal PDF text
     # --------------------------------------------------------
 
     try:
-        normal_text = _extract_pdf_text(content)
+
+        normal_text = _extract_pdf_text(
+            content
+        )
 
     except Exception:
-        logger.exception("Normal PDF extraction failed")
+
+        logger.exception(
+            "Normal PDF extraction failed"
+        )
+
         normal_text = ""
 
-    questions = _parse_text_mcqs(
+    normal_questions = _parse_text_mcqs(
         normal_text,
         max_questions=max_questions,
     )
 
     logger.info(
         "Normal PDF extraction found %s MCQs",
-        len(questions),
+        len(normal_questions),
     )
 
-    # If enough questions were found, don't waste time on OCR
-    if len(questions) >= 10:
-        return questions[:max_questions]
-
     # --------------------------------------------------------
-    # STEP 2: OCR fallback
+    # OCR
     # --------------------------------------------------------
-
-    logger.info(
-        "Normal extraction found only %s MCQs. "
-        "Starting English + Malayalam OCR.",
-        len(questions),
-    )
 
     try:
+
         ocr_text = _ocr_pdf(
             content,
-            max_pages=100,
+            max_pages=150,
         )
 
     except Exception:
-        logger.exception("OCR processing failed")
+
+        logger.exception(
+            "OCR processing failed"
+        )
+
         ocr_text = ""
+
+    ocr_questions = []
 
     if ocr_text:
 
@@ -576,23 +883,28 @@ def process_pdf_mcqs(
         )
 
         logger.info(
-            "OCR extraction found %s MCQs",
+            "English + Malayalam OCR found %s MCQs",
             len(ocr_questions),
         )
 
-        # Prefer OCR result if it found more questions
-        if len(ocr_questions) > len(questions):
-            questions = ocr_questions
+    # --------------------------------------------------------
+    # Choose better result
+    # --------------------------------------------------------
 
-    return questions[:max_questions]
+    if len(ocr_questions) > len(normal_questions):
+
+        return ocr_questions[:max_questions]
+
+    return normal_questions[:max_questions]
 
 
 # ============================================================
 # JSON SUPPORT
 # ============================================================
 
-def _normalise_json_question(item: Dict[str, Any]):
-    """Convert common JSON MCQ structures into bot format."""
+def _normalise_json_question(
+    item: Dict[str, Any],
+):
 
     if not isinstance(item, dict):
         return None
@@ -626,17 +938,38 @@ def _normalise_json_question(item: Dict[str, Any]):
 
         normalised_options = []
 
-        for letter in ["A", "B", "C", "D"]:
+        for letter in [
+            "A",
+            "B",
+            "C",
+            "D",
+        ]:
 
             value = (
                 options.get(letter)
                 or options.get(letter.lower())
             )
 
+            # Malayalam labels
+            if value is None:
+
+                mal_letter = {
+                    "A": "എ",
+                    "B": "ബി",
+                    "C": "സി",
+                    "D": "ഡി",
+                }[letter]
+
+                value = options.get(
+                    mal_letter
+                )
+
             if value is None:
                 return None
 
-            normalised_options.append(str(value))
+            normalised_options.append(
+                str(value)
+            )
 
         options = normalised_options
 
@@ -656,7 +989,7 @@ def _normalise_json_question(item: Dict[str, Any]):
     else:
         return None
 
-    # Answer can be letter or index
+    # Answer can be integer
     if isinstance(answer, int):
 
         if 0 <= answer <= 3:
@@ -668,14 +1001,30 @@ def _normalise_json_question(item: Dict[str, Any]):
         else:
             return None
 
-    answer = str(answer).strip().upper()
+    answer = str(
+        answer
+    ).strip().upper()
 
-    if answer not in {"A", "B", "C", "D"}:
+    # Malayalam answer
+    answer = _normalise_option_letter(
+        answer
+    )
+
+    if answer not in {
+        "A",
+        "B",
+        "C",
+        "D",
+    }:
         return None
 
     return {
-        "question": str(question).strip(),
+        "question": str(
+            question
+        ).strip(),
+
         "options": options,
+
         "answer": answer,
     }
 
@@ -684,21 +1033,23 @@ def _parse_json_mcqs(
     content: bytes,
     max_questions: int = 300,
 ) -> List[Dict[str, Any]]:
-    """Parse JSON MCQs."""
 
     try:
+
         data = json.loads(
-            content.decode("utf-8-sig")
+            content.decode(
+                "utf-8-sig"
+            )
         )
 
     except Exception:
-        logger.exception("Invalid JSON file")
+
+        logger.exception(
+            "Invalid JSON file"
+        )
+
         return []
 
-    # Support:
-    # [...]
-    # {"questions": [...]}
-    # {"mcqs": [...]}
     if isinstance(data, dict):
 
         data = (
@@ -718,10 +1069,14 @@ def _parse_json_mcqs(
         if len(questions) >= max_questions:
             break
 
-        question = _normalise_json_question(item)
+        question = _normalise_json_question(
+            item
+        )
 
         if question:
-            questions.append(question)
+            questions.append(
+                question
+            )
 
     return questions
 
@@ -736,19 +1091,12 @@ async def process_uploaded_file(
     max_questions: int = 300,
 ) -> List[Dict[str, Any]]:
     """
-    Process uploaded TXT, JSON or PDF.
-
-    PDF:
-        Text extraction -> OCR fallback
-
-    JSON:
-        JSON MCQ parser
-
-    TXT:
-        Text MCQ parser
+    Process TXT, JSON or PDF.
     """
 
-    filename_lower = (filename or "").lower()
+    filename_lower = (
+        filename or ""
+    ).lower()
 
     # --------------------------------------------------------
     # PDF
@@ -779,26 +1127,26 @@ async def process_uploaded_file(
     if filename_lower.endswith(".txt"):
 
         try:
+
             text = content.decode(
                 "utf-8-sig",
                 errors="ignore",
             )
 
         except Exception:
-            return []
+
+            text = content.decode(
+                "utf-8",
+                errors="ignore",
+            )
 
         return _parse_text_mcqs(
             text,
             max_questions=max_questions,
         )
 
-    # Unsupported file
     return []
 
-
-# ============================================================
-# SYNCHRONOUS HELPER
-# ============================================================
 
 def process_uploaded_file_sync(
     content: bytes,
@@ -806,11 +1154,12 @@ def process_uploaded_file_sync(
     max_questions: int = 300,
 ) -> List[Dict[str, Any]]:
     """
-    Synchronous version for places where async processing
-    is not required.
+    Synchronous wrapper.
     """
 
-    filename_lower = (filename or "").lower()
+    filename_lower = (
+        filename or ""
+    ).lower()
 
     if filename_lower.endswith(".pdf"):
 
@@ -828,14 +1177,10 @@ def process_uploaded_file_sync(
 
     if filename_lower.endswith(".txt"):
 
-        try:
-            text = content.decode(
-                "utf-8-sig",
-                errors="ignore",
-            )
-
-        except Exception:
-            return []
+        text = content.decode(
+            "utf-8-sig",
+            errors="ignore",
+        )
 
         return _parse_text_mcqs(
             text,
@@ -843,14 +1188,3 @@ def process_uploaded_file_sync(
         )
 
     return []
-
-
-# ============================================================
-# TEST / DEBUG
-# ============================================================
-
-if __name__ == "__main__":
-
-    print(
-        "PSCGram file_import.py loaded successfully."
-    )
