@@ -1,11 +1,26 @@
-from __future__ import annotations
+"""
+PSCGram QuizBot - File Import / PDF Parser
+
+Supports:
+- TXT
+- JSON
+- Text-based PDF
+- Scanned/image PDF using OCR
+- English OCR
+- Malayalam OCR
+- Automatic MCQ extraction
+- No AI required
+"""
 
 import io
 import json
 import re
+import logging
 from typing import Any, Dict, List, Optional
 
 import fitz  # PyMuPDF
+
+logger = logging.getLogger(__name__)
 
 
 # ============================================================
@@ -13,57 +28,38 @@ import fitz  # PyMuPDF
 # ============================================================
 
 def strip_source_noise(text: str) -> str:
-    """
-    Remove common PSCGram/PDF header and footer noise.
-    """
+    """Remove common PDF/source noise without changing MCQ content."""
+
     if not text:
         return ""
 
-    lines = []
+    # Normalize line endings
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
 
-    for line in text.splitlines():
-        line = line.strip()
+    # Remove null characters
+    text = text.replace("\x00", "")
 
-        if not line:
-            continue
-
-        # PSCGram branding / Telegram handles
-        if re.fullmatch(
-            r"(?i)(@psc_gram|@pscgram|pscgram|psc\s*gram)",
-            line,
-        ):
-            continue
-
-        # Common page/header/footer patterns
-        if re.match(r"(?i)^page\s+\d+(\s+of\s+\d+)?$", line):
-            continue
-
-        if re.match(r"(?i)^page\s*[:\-]?\s*\d+$", line):
-            continue
-
-        if re.match(r"(?i)^source\s+pdf\s+p\.?\s*\d+", line):
-            continue
-
-        if re.match(r"(?i)^pscgram\s*\|", line):
-            continue
-
-        lines.append(line)
-
-    return "\n".join(lines)
-
-
-def filter_words(text: str) -> str:
-    """
-    Basic cleanup while preserving question content.
-    """
-    if not text:
-        return ""
-
-    text = text.replace("\r\n", "\n")
-    text = text.replace("\r", "\n")
-
-    # Remove excessive spaces
+    # Remove repeated spaces
     text = re.sub(r"[ \t]+", " ", text)
+
+    # Remove obvious page-number-only lines
+    text = re.sub(
+        r"(?im)^\s*(?:page\s*)?\d+\s*$",
+        "",
+        text,
+    )
+
+    # Remove common PSCGram branding/noise
+    noise_patterns = [
+        r"(?im)^\s*@psc_?gram\s*$",
+        r"(?im)^\s*@pscgram\s*$",
+        r"(?im)^\s*psc\s*gram\s*$",
+        r"(?im)^\s*telegram\s*:\s*@?psc_?gram\s*$",
+        r"(?im)^\s*youtube\s*:\s*@?pscgram\s*$",
+    ]
+
+    for pattern in noise_patterns:
+        text = re.sub(pattern, "", text)
 
     # Remove excessive blank lines
     text = re.sub(r"\n{3,}", "\n\n", text)
@@ -71,238 +67,441 @@ def filter_words(text: str) -> str:
     return text.strip()
 
 
+def filter_words(text: str) -> str:
+    """Clean OCR/PDF text while preserving Malayalam and English."""
+
+    if not text:
+        return ""
+
+    # Fix common OCR spacing problems
+    text = text.replace("\u00a0", " ")
+
+    # Normalize spaces
+    text = re.sub(r"[ \t]+", " ", text)
+
+    # Normalize blank lines
+    text = re.sub(r"\n{3,}", "\n\n", text)
+
+    return text.strip()
+
+
 # ============================================================
-# TEXT / JSON IMPORT
+# OPTION / ANSWER HELPERS
 # ============================================================
 
-def parse_question_block(block: str) -> Optional[Dict[str, Any]]:
+OPTION_RE = re.compile(
+    r"^\s*(?:"
+    r"\(?([A-Da-d])\)?"
+    r"[\.\):\-]\s*"
+    r"|"
+    r"([A-Da-d])\s+"
+    r")(.+?)\s*$"
+)
+
+ANSWER_RE = re.compile(
+    r"^\s*"
+    r"(?:"
+    r"answer"
+    r"|ans"
+    r"|correct\s+answer"
+    r"|correct\s+ans"
+    r"|"
+    r"ഉത്തരം"
+    r"|ശരിയുത്തരം"
+    r"|ശരിയായ\s+ഉത്തരം"
+    r")"
+    r"\s*[:\-\.]?\s*"
+    r"[\(\[]?\s*([A-Da-d])\s*[\)\]]?"
+    r"\s*$",
+    re.IGNORECASE,
+)
+
+
+def _extract_option(line: str):
     """
-    Parse a single MCQ block.
+    Extract A/B/C/D option.
 
-    Supported examples:
+    Supports:
+        A. Option
+        A) Option
+        (A) Option
+        A: Option
+        A - Option
+    """
 
-    1. What is the capital of Kerala?
-    A) Thiruvananthapuram
-    B) Kochi
-    C) Kollam
-    D) Kannur
+    if not line:
+        return None
+
+    match = OPTION_RE.match(line)
+
+    if not match:
+        return None
+
+    letter = match.group(1) or match.group(2)
+    value = match.group(3)
+
+    if not letter or not value:
+        return None
+
+    letter = letter.upper()
+    value = value.strip()
+
+    if letter not in {"A", "B", "C", "D"}:
+        return None
+
+    return letter, value
+
+
+def _extract_answer(line: str):
+    """Extract answer letter from English or Malayalam answer lines."""
+
+    if not line:
+        return None
+
+    match = ANSWER_RE.match(line.strip())
+
+    if not match:
+        return None
+
+    answer = match.group(1).upper()
+
+    if answer in {"A", "B", "C", "D"}:
+        return answer
+
+    return None
+
+
+# ============================================================
+# QUESTION DETECTION
+# ============================================================
+
+QUESTION_RE = re.compile(
+    r"^\s*"
+    r"(?:"
+    r"Q(?:uestion)?\s*"
+    r")?"
+    r"(\d{1,4})"
+    r"\s*[\.\):\-]\s*"
+    r"(.+?)"
+    r"\s*$",
+    re.IGNORECASE,
+)
+
+
+def _is_question_start(line: str) -> bool:
+    """Return True if line looks like a numbered question."""
+
+    if not line:
+        return False
+
+    line = line.strip()
+
+    return bool(QUESTION_RE.match(line))
+
+
+def _extract_question_number(line: str):
+    """Extract question number and text."""
+
+    match = QUESTION_RE.match(line.strip())
+
+    if not match:
+        return None
+
+    number = match.group(1)
+    question = match.group(2).strip()
+
+    return number, question
+
+
+# ============================================================
+# PARSE ONE QUESTION BLOCK
+# ============================================================
+
+def parse_question_block(lines: List[str]) -> Optional[Dict[str, Any]]:
+    """
+    Parse one MCQ block.
+
+    Expected structure:
+
+    1. Question text
+    A. Option one
+    B. Option two
+    C. Option three
+    D. Option four
     ANSWER: A
 
-    Also supports:
-    Q1. ...
-    1) ...
-    1. ...
+    Malayalam is also supported.
     """
 
-    if not block:
+    if not lines:
         return None
 
-    block = filter_words(strip_source_noise(block))
+    cleaned = []
 
-    if not block:
+    for line in lines:
+        line = line.strip()
+
+        if line:
+            cleaned.append(line)
+
+    if not cleaned:
         return None
 
-    # --------------------------------------------------------
-    # Question number
-    # --------------------------------------------------------
+    # Find question line
+    question_index = None
+    question_text = ""
 
-    q_match = re.search(
-        r"(?im)^\s*(?:Q(?:uestion)?\s*)?(\d{1,4})[\.\):\-]\s*(.+)",
-        block,
-    )
+    for i, line in enumerate(cleaned):
+        result = _extract_question_number(line)
 
-    if not q_match:
+        if result:
+            question_index = i
+            _, question_text = result
+            break
+
+    if question_index is None:
         return None
 
-    question_number = q_match.group(1)
-    first_question_line = q_match.group(2).strip()
+    options = {}
+    answer = None
 
-    # --------------------------------------------------------
-    # Find answer
-    # --------------------------------------------------------
+    # Everything after question line
+    for line in cleaned[question_index + 1:]:
 
-    answer_match = re.search(
-        r"(?im)^\s*(?:ANSWER|ANS|CORRECT\s*ANSWER|KEY)\s*"
-        r"[:\-]?\s*[\(\[]?\s*([A-D])\s*[\)\]]?",
-        block,
-    )
+        # Answer
+        detected_answer = _extract_answer(line)
 
-    if not answer_match:
-        # Sometimes answer appears as:
-        # ANSWER A
-        answer_match = re.search(
-            r"(?im)\b(?:ANSWER|ANS|KEY)\s*[:\-]?\s*([A-D])\b",
-            block,
-        )
+        if detected_answer:
+            answer = detected_answer
+            continue
 
-    if not answer_match:
-        return None
+        # Option
+        option = _extract_option(line)
 
-    correct_letter = answer_match.group(1).upper()
+        if option:
+            letter, value = option
+            options[letter] = value
+            continue
 
-    # --------------------------------------------------------
-    # Remove answer portion
-    # --------------------------------------------------------
+        # Sometimes the question continues over multiple lines
+        if len(options) == 0:
+            if question_text:
+                question_text += " " + line
 
-    question_part = block[:answer_match.start()].strip()
-
-    # Remove question number from first line
-    question_part = re.sub(
-        r"^\s*(?:Q(?:uestion)?\s*)?\d{1,4}[\.\):\-]\s*",
-        "",
-        question_part,
-        count=1,
-        flags=re.I,
-    ).strip()
-
-    # --------------------------------------------------------
-    # Extract options
-    # --------------------------------------------------------
-
-    option_pattern = re.compile(
-        r"(?im)^\s*([A-D])[\.\):\-]\s*(.+?)(?=\n\s*[A-D][\.\):\-]\s*|\Z)",
-        re.S,
-    )
-
-    option_matches = list(option_pattern.finditer(question_part))
-
-    options: List[str] = []
-
-    if option_matches:
-        # Text before A) is the actual question
-        question_text = question_part[: option_matches[0].start()].strip()
-
-        for match in option_matches:
-            option_text = match.group(2).strip()
-            option_text = re.sub(r"\s+", " ", option_text)
-
-            if option_text:
-                options.append(option_text)
-
-    else:
-        # Alternative parser for inline options:
-        # A) xxx B) yyy C) zzz D) aaa
-        inline_pattern = re.compile(
-            r"(?i)(?:^|\s)([A-D])[\.\):\-]\s*"
-        )
-
-        inline_matches = list(inline_pattern.finditer(question_part))
-
-        if len(inline_matches) >= 2:
-            question_text = question_part[: inline_matches[0].start()].strip()
-
-            for i, match in enumerate(inline_matches):
-                start = match.end()
-
-                if i + 1 < len(inline_matches):
-                    end = inline_matches[i + 1].start()
-                else:
-                    end = len(question_part)
-
-                option_text = question_part[start:end].strip()
-                option_text = re.sub(r"\s+", " ", option_text)
-
-                if option_text:
-                    options.append(option_text)
-        else:
-            return None
-
-    # Need at least 2 choices
-    if len(options) < 2:
-        return None
-
-    # Limit to four choices
-    options = options[:4]
-
-    # Correct answer index
-    correct_index = ord(correct_letter) - ord("A")
-
-    if correct_index < 0 or correct_index >= len(options):
-        return None
-
-    question_text = re.sub(r"\s+", " ", question_text).strip()
-
+    # Must have four options
     if not question_text:
         return None
 
-    # --------------------------------------------------------
-    # Build result
-    # --------------------------------------------------------
+    if not all(letter in options for letter in ["A", "B", "C", "D"]):
+        return None
+
+    # If answer is missing, try to find answer from text
+    if answer not in {"A", "B", "C", "D"}:
+        return None
 
     return {
-        "question": question_text,
-        "options": options,
-        "correct_option_id": correct_index,
-        "answer": correct_letter,
-        "explanation": "",
-        "reply_text": question_text,
-        "file_id": None,
-        "question_number": question_number,
+        "question": question_text.strip(),
+        "options": [
+            options["A"],
+            options["B"],
+            options["C"],
+            options["D"],
+        ],
+        "answer": answer,
     }
 
 
 # ============================================================
-# TEXT PARSER
+# TEXT MCQ PARSER
 # ============================================================
 
 def _parse_text_mcqs(text: str, max_questions: int = 300) -> List[Dict[str, Any]]:
     """
-    Parse MCQs from plain text.
+    Parse MCQs from extracted PDF/OCR text.
     """
 
-    text = filter_words(strip_source_noise(text))
+    text = strip_source_noise(text)
+    text = filter_words(text)
 
     if not text:
         return []
 
-    # --------------------------------------------------------
-    # Find question starts.
-    #
-    # Supports:
-    # 1.
-    # 1)
-    # Q1.
-    # Q1)
-    # Question 1.
-    # --------------------------------------------------------
+    lines = [line.strip() for line in text.splitlines()]
 
-    question_start = re.compile(
-        r"(?im)^\s*"
-        r"(?:Q(?:uestion)?\s*)?"
-        r"(\d{1,4})"
-        r"[\.\):\-]\s*"
-    )
+    blocks = []
+    current_block = []
 
-    matches = list(question_start.finditer(text))
+    for line in lines:
 
-    if not matches:
-        return []
+        if not line:
+            continue
 
-    questions: List[Dict[str, Any]] = []
+        # New question
+        if _is_question_start(line):
 
-    for i, match in enumerate(matches):
+            if current_block:
+                blocks.append(current_block)
+
+            current_block = [line]
+
+        else:
+
+            if current_block:
+                current_block.append(line)
+
+    if current_block:
+        blocks.append(current_block)
+
+    questions = []
+
+    for block in blocks:
+
         if len(questions) >= max_questions:
             break
 
-        start = match.start()
+        try:
+            question = parse_question_block(block)
 
-        if i + 1 < len(matches):
-            end = matches[i + 1].start()
-        else:
-            end = len(text)
+            if question:
+                questions.append(question)
 
-        block = text[start:end].strip()
-
-        parsed = parse_question_block(block)
-
-        if parsed:
-            questions.append(parsed)
+        except Exception:
+            logger.exception("Error parsing MCQ block")
 
     return questions
 
 
 # ============================================================
-# PDF PARSER
+# PDF TEXT EXTRACTION
+# ============================================================
+
+def _extract_pdf_text(pdf_bytes: bytes) -> str:
+    """Extract normal embedded text from PDF."""
+
+    output = []
+
+    document = None
+
+    try:
+        document = fitz.open(stream=pdf_bytes, filetype="pdf")
+
+        for page in document:
+            try:
+                text = page.get_text("text")
+
+                if text:
+                    output.append(text)
+
+            except Exception:
+                logger.exception("Failed extracting text from PDF page")
+
+    finally:
+        if document is not None:
+            document.close()
+
+    return "\n".join(output)
+
+
+# ============================================================
+# OCR
+# ============================================================
+
+def _ocr_pdf(
+    pdf_bytes: bytes,
+    max_pages: int = 100,
+) -> str:
+    """
+    OCR scanned PDF pages.
+
+    Languages:
+        eng = English
+        mal = Malayalam
+
+    Requires:
+        tesseract-ocr
+        tesseract-ocr-eng
+        tesseract-ocr-mal
+        pytesseract
+        Pillow
+    """
+
+    try:
+        import pytesseract
+        from PIL import Image
+
+    except ImportError:
+        logger.exception(
+            "OCR dependencies are missing. "
+            "Install pytesseract and Pillow."
+        )
+        return ""
+
+    output = []
+
+    document = None
+
+    try:
+        document = fitz.open(stream=pdf_bytes, filetype="pdf")
+
+        page_count = min(len(document), max_pages)
+
+        logger.info(
+            "Starting OCR: %s pages, languages=eng+mal",
+            page_count,
+        )
+
+        for page_number in range(page_count):
+
+            try:
+                page = document[page_number]
+
+                # Render page at higher resolution for better OCR
+                matrix = fitz.Matrix(2.5, 2.5)
+
+                pix = page.get_pixmap(
+                    matrix=matrix,
+                    alpha=False,
+                )
+
+                image = Image.frombytes(
+                    "RGB",
+                    [pix.width, pix.height],
+                    pix.samples,
+                )
+
+                text = pytesseract.image_to_string(
+                    image,
+                    lang="eng+mal",
+                    config="--psm 6",
+                )
+
+                if text:
+                    output.append(text)
+
+                logger.info(
+                    "OCR completed page %s/%s",
+                    page_number + 1,
+                    page_count,
+                )
+
+            except Exception:
+                logger.exception(
+                    "OCR failed on page %s",
+                    page_number + 1,
+                )
+
+    except Exception:
+        logger.exception("Failed opening PDF for OCR")
+
+    finally:
+        if document is not None:
+            document.close()
+
+    return "\n".join(output)
+
+
+# ============================================================
+# PDF MCQ PROCESSING
 # ============================================================
 
 def process_pdf_mcqs(
@@ -310,143 +509,174 @@ def process_pdf_mcqs(
     max_questions: int = 300,
 ) -> List[Dict[str, Any]]:
     """
-    Extract existing MCQs from a text-based PDF.
+    Convert PDF bytes into MCQs.
 
-    IMPORTANT:
-    This does NOT use AI.
+    Processing order:
 
-    It expects the PDF to already contain:
-      Question
-      A) option
-      B) option
-      C) option
-      D) option
-      ANSWER: A
-
-    Scanned/image-only PDFs will not work without OCR.
+    1. Extract normal PDF text.
+    2. Try MCQ parser.
+    3. If insufficient MCQs are found,
+       automatically run English + Malayalam OCR.
+    4. Parse OCR result.
     """
 
     if not content:
         return []
 
+    # --------------------------------------------------------
+    # STEP 1: Normal PDF text extraction
+    # --------------------------------------------------------
+
     try:
-        pdf = fitz.open(stream=content, filetype="pdf")
+        normal_text = _extract_pdf_text(content)
+
     except Exception:
-        return []
+        logger.exception("Normal PDF extraction failed")
+        normal_text = ""
 
-    all_pages: List[str] = []
-
-    try:
-        for page in pdf:
-            try:
-                page_text = page.get_text("text")
-            except Exception:
-                page_text = ""
-
-            if page_text:
-                all_pages.append(page_text)
-    finally:
-        pdf.close()
-
-    full_text = "\n".join(all_pages)
-
-    if not full_text.strip():
-        return []
-
-    return _parse_text_mcqs(
-        full_text,
+    questions = _parse_text_mcqs(
+        normal_text,
         max_questions=max_questions,
     )
 
+    logger.info(
+        "Normal PDF extraction found %s MCQs",
+        len(questions),
+    )
+
+    # If enough questions were found, don't waste time on OCR
+    if len(questions) >= 10:
+        return questions[:max_questions]
+
+    # --------------------------------------------------------
+    # STEP 2: OCR fallback
+    # --------------------------------------------------------
+
+    logger.info(
+        "Normal extraction found only %s MCQs. "
+        "Starting English + Malayalam OCR.",
+        len(questions),
+    )
+
+    try:
+        ocr_text = _ocr_pdf(
+            content,
+            max_pages=100,
+        )
+
+    except Exception:
+        logger.exception("OCR processing failed")
+        ocr_text = ""
+
+    if ocr_text:
+
+        ocr_questions = _parse_text_mcqs(
+            ocr_text,
+            max_questions=max_questions,
+        )
+
+        logger.info(
+            "OCR extraction found %s MCQs",
+            len(ocr_questions),
+        )
+
+        # Prefer OCR result if it found more questions
+        if len(ocr_questions) > len(questions):
+            questions = ocr_questions
+
+    return questions[:max_questions]
+
 
 # ============================================================
-# JSON PARSER
+# JSON SUPPORT
 # ============================================================
 
-def _normalise_json_question(item: Any) -> Optional[Dict[str, Any]]:
-    """
-    Convert common JSON MCQ formats into the bot's internal format.
-    """
+def _normalise_json_question(item: Dict[str, Any]):
+    """Convert common JSON MCQ structures into bot format."""
 
     if not isinstance(item, dict):
         return None
 
     question = (
         item.get("question")
+        or item.get("Question")
         or item.get("text")
-        or item.get("question_text")
+        or item.get("q")
     )
 
     options = (
         item.get("options")
+        or item.get("Options")
         or item.get("choices")
-        or item.get("answers")
+        or item.get("Choices")
     )
-
-    if not question or not options:
-        return None
-
-    if isinstance(options, dict):
-        # Example:
-        # {"A": "...", "B": "...", "C": "...", "D": "..."}
-        ordered = []
-
-        for key in ("A", "B", "C", "D"):
-            if key in options:
-                ordered.append(str(options[key]))
-
-        options = ordered
-
-    if not isinstance(options, list):
-        return None
-
-    options = [str(x).strip() for x in options if str(x).strip()]
-
-    if len(options) < 2:
-        return None
-
-    options = options[:4]
 
     answer = (
         item.get("answer")
-        or item.get("correct_answer")
+        or item.get("Answer")
         or item.get("correct")
-        or item.get("answer_index")
-        or item.get("correct_option_id")
+        or item.get("correct_answer")
     )
 
-    correct_index: Optional[int] = None
-
-    if isinstance(answer, int):
-        correct_index = answer
-
-    elif isinstance(answer, str):
-        answer_clean = answer.strip().upper()
-
-        # A/B/C/D
-        if answer_clean in ("A", "B", "C", "D"):
-            correct_index = ord(answer_clean) - ord("A")
-        else:
-            # Try exact option match
-            for idx, option in enumerate(options):
-                if option.strip().lower() == answer.strip().lower():
-                    correct_index = idx
-                    break
-
-    if correct_index is None:
+    if not question or not options or answer is None:
         return None
 
-    if correct_index < 0 or correct_index >= len(options):
+    # Dictionary options
+    if isinstance(options, dict):
+
+        normalised_options = []
+
+        for letter in ["A", "B", "C", "D"]:
+
+            value = (
+                options.get(letter)
+                or options.get(letter.lower())
+            )
+
+            if value is None:
+                return None
+
+            normalised_options.append(str(value))
+
+        options = normalised_options
+
+    # List options
+    elif isinstance(options, list):
+
+        if len(options) < 4:
+            return None
+
+        options = [
+            str(options[0]),
+            str(options[1]),
+            str(options[2]),
+            str(options[3]),
+        ]
+
+    else:
+        return None
+
+    # Answer can be letter or index
+    if isinstance(answer, int):
+
+        if 0 <= answer <= 3:
+            answer = "ABCD"[answer]
+
+        elif 1 <= answer <= 4:
+            answer = "ABCD"[answer - 1]
+
+        else:
+            return None
+
+    answer = str(answer).strip().upper()
+
+    if answer not in {"A", "B", "C", "D"}:
         return None
 
     return {
         "question": str(question).strip(),
         "options": options,
-        "correct_option_id": correct_index,
-        "answer": chr(ord("A") + correct_index),
-        "explanation": str(item.get("explanation", "") or ""),
-        "reply_text": str(question).strip(),
-        "file_id": item.get("file_id"),
+        "answer": answer,
     }
 
 
@@ -454,69 +684,78 @@ def _parse_json_mcqs(
     content: bytes,
     max_questions: int = 300,
 ) -> List[Dict[str, Any]]:
+    """Parse JSON MCQs."""
+
     try:
-        raw = json.loads(content.decode("utf-8"))
+        data = json.loads(
+            content.decode("utf-8-sig")
+        )
+
     except Exception:
+        logger.exception("Invalid JSON file")
         return []
 
-    if isinstance(raw, dict):
-        # Common containers
-        raw = (
-            raw.get("questions")
-            or raw.get("quiz")
-            or raw.get("items")
+    # Support:
+    # [...]
+    # {"questions": [...]}
+    # {"mcqs": [...]}
+    if isinstance(data, dict):
+
+        data = (
+            data.get("questions")
+            or data.get("mcqs")
+            or data.get("data")
             or []
         )
 
-    if not isinstance(raw, list):
+    if not isinstance(data, list):
         return []
 
-    questions: List[Dict[str, Any]] = []
+    questions = []
 
-    for item in raw:
+    for item in data:
+
         if len(questions) >= max_questions:
             break
 
-        parsed = _normalise_json_question(item)
+        question = _normalise_json_question(item)
 
-        if parsed:
-            questions.append(parsed)
+        if question:
+            questions.append(question)
 
     return questions
 
 
 # ============================================================
-# MAIN FILE IMPORT FUNCTION
+# FILE PROCESSOR
 # ============================================================
 
 async def process_uploaded_file(
     content: bytes,
-    filename: str = "",
-    mime_type: str = "",
+    filename: str,
     max_questions: int = 300,
 ) -> List[Dict[str, Any]]:
     """
-    Main importer used by the creator bot.
+    Process uploaded TXT, JSON or PDF.
 
-    Supported:
-      .txt
-      .json
-      .pdf
+    PDF:
+        Text extraction -> OCR fallback
 
-    PDF is parsed without AI.
+    JSON:
+        JSON MCQ parser
+
+    TXT:
+        Text MCQ parser
     """
 
-    filename_lower = (filename or "").lower().strip()
-    mime_lower = (mime_type or "").lower().strip()
+    filename_lower = (filename or "").lower()
 
     # --------------------------------------------------------
     # PDF
     # --------------------------------------------------------
 
-    if (
-        filename_lower.endswith(".pdf")
-        or mime_lower == "application/pdf"
-    ):
+    if filename_lower.endswith(".pdf"):
+
         return process_pdf_mcqs(
             content,
             max_questions=max_questions,
@@ -526,11 +765,8 @@ async def process_uploaded_file(
     # JSON
     # --------------------------------------------------------
 
-    if (
-        filename_lower.endswith(".json")
-        or mime_lower == "application/json"
-        or mime_lower.endswith("+json")
-    ):
+    if filename_lower.endswith(".json"):
+
         return _parse_json_mcqs(
             content,
             max_questions=max_questions,
@@ -540,12 +776,14 @@ async def process_uploaded_file(
     # TXT
     # --------------------------------------------------------
 
-    if (
-        filename_lower.endswith(".txt")
-        or mime_lower.startswith("text/")
-    ):
+    if filename_lower.endswith(".txt"):
+
         try:
-            text = content.decode("utf-8", errors="ignore")
+            text = content.decode(
+                "utf-8-sig",
+                errors="ignore",
+            )
+
         except Exception:
             return []
 
@@ -554,6 +792,7 @@ async def process_uploaded_file(
             max_questions=max_questions,
         )
 
+    # Unsupported file
     return []
 
 
@@ -563,42 +802,38 @@ async def process_uploaded_file(
 
 def process_uploaded_file_sync(
     content: bytes,
-    filename: str = "",
-    mime_type: str = "",
+    filename: str,
     max_questions: int = 300,
 ) -> List[Dict[str, Any]]:
     """
-    Synchronous helper for handlers that don't need await.
+    Synchronous version for places where async processing
+    is not required.
     """
 
-    filename_lower = (filename or "").lower().strip()
-    mime_lower = (mime_type or "").lower().strip()
+    filename_lower = (filename or "").lower()
 
-    if (
-        filename_lower.endswith(".pdf")
-        or mime_lower == "application/pdf"
-    ):
+    if filename_lower.endswith(".pdf"):
+
         return process_pdf_mcqs(
             content,
             max_questions=max_questions,
         )
 
-    if (
-        filename_lower.endswith(".json")
-        or mime_lower == "application/json"
-        or mime_lower.endswith("+json")
-    ):
+    if filename_lower.endswith(".json"):
+
         return _parse_json_mcqs(
             content,
             max_questions=max_questions,
         )
 
-    if (
-        filename_lower.endswith(".txt")
-        or mime_lower.startswith("text/")
-    ):
+    if filename_lower.endswith(".txt"):
+
         try:
-            text = content.decode("utf-8", errors="ignore")
+            text = content.decode(
+                "utf-8-sig",
+                errors="ignore",
+            )
+
         except Exception:
             return []
 
@@ -608,3 +843,14 @@ def process_uploaded_file_sync(
         )
 
     return []
+
+
+# ============================================================
+# TEST / DEBUG
+# ============================================================
+
+if __name__ == "__main__":
+
+    print(
+        "PSCGram file_import.py loaded successfully."
+    )
