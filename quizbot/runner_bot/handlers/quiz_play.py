@@ -852,6 +852,7 @@ async def _send_mid_quiz_leaderboard(chat_id: int, ctx: ContextTypes.DEFAULT_TYP
         logger.error("_send_mid_quiz_leaderboard error: %s", e)
 
 
+
 async def _send_explanation_after_poll(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, q: dict, thread_id: Optional[int] = None) -> None:
     """Send the post-answer explanation. Uses sendRichMessage (Bot API 10.1)
     when the explanation contains rich/math markup that the plain 4096-char
@@ -866,7 +867,8 @@ async def _send_explanation_after_poll(ctx: ContextTypes.DEFAULT_TYPE, chat_id: 
         kw: dict[str, Any] = {}
         if thread_id:
             kw["message_thread_id"] = thread_id
-                    if _is_rich(expl):
+
+        if _is_rich(expl):
             body = _normalise_math_spacing(f"\U0001F4A1 **Explanation:**\n\n{expl}")
             await send_rich_or_fallback(
                 lambda method, params: send_raw_api(ctx, method, params),
