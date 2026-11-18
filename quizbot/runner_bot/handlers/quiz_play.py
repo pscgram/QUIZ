@@ -577,7 +577,7 @@ async def _run_sectioned_quiz(chat_id, ctx, questions, quiz, sections, protect, 
         global_neg = quiz.get("negative_marking", 0)
         sec_cm = section.get("correct_mark", global_cm)
         sec_neg = section.get("neg_mark", global_neg)
-                sec_msg = await safe_send_message(
+        sec_msg = await safe_send_message(
             ctx, chat_id,
             f"\U0001F4DA <b>{sec_name}</b>\n\U0001F4CB Q{start_q}–{end_q}  ({n_qs_sec} questions)\n"
             f"{mode_lbl}  ·  Marks: +{sec_cm} / -{sec_neg}",
