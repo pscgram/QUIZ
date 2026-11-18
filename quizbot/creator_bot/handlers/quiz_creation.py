@@ -1,13 +1,19 @@
 """
-Advance Quiz Bot — Open Source Project
-This project was originally developed by Gagan (github.com/devgaganin).
-Reference: https://t.me/advance_quiz_bot
-The codebase has been reviewed and verified with the assistance of Claude AI.
+PSCGram Quiz Bot — Creator Quiz Creation Handler
+
+Supports:
+- /create wizard
+- Manual MCQ creation
+- Quiz poll importing
+- TXT / JSON importing
+- DIRECT PDF -> MCQ -> QUIZ
+- No AI required for PDF parsing
 """
 
 from __future__ import annotations
 
 import logging
+import os
 from typing import Optional
 
 from pyrogram import Client, filters
@@ -19,7 +25,12 @@ from pyrogram.types import (
     Message,
 )
 
-from quizbot.database import CreatorSettingsRepository, QuizRepository, UserRepository, get_db
+from quizbot.database import (
+    CreatorSettingsRepository,
+    QuizRepository,
+    UserRepository,
+    get_db,
+)
 from quizbot.shared import config
 from quizbot.shared.mini_app_link import mini_app_web_app_button
 from quizbot.shared.utils import is_premium_user
@@ -30,63 +41,149 @@ from ..ratelimit import ratelimit
 from ..subscribe_gate import subscribe_gate
 from .file_import import process_uploaded_file
 
+
 logger = logging.getLogger(__name__)
 
 
-def _poll_text(value) -> Optional[str]:
-    """Unwrap a poll's question/option/explanation field to a plain str.
-
-    Newer Pyrogram forks (Kurigram) return these as `FormattedText` objects
-    (with a `.text` attribute + entities) instead of a bare `str`, so any
-    downstream `re.sub`/string handling breaks with a TypeError unless we
-    normalize here first. Handles both the old (str) and new (FormattedText)
-    shapes, plus a plain None."""
-    if value is None:
-        return None
-    text = getattr(value, "text", None)
-    if text is not None:
-        return str(text)
-    return str(value)
-
-
-# Commands that must always be reachable even while a quiz-creation wizard
-# is in progress -- the free-text/poll catch-all handler must not swallow
-# these. Mirrors the exclusion list from the original bot's message filter.
-_RESERVED_COMMANDS = [
-    "start", "create", "myquizzes", "edit", "info", "ban", "done", "add", "rem",
-    "remall", "del", "remove", "clearlist", "mywords", "help", "cancel", "quiz",
-    "search", "auth", "pay", "setpromo", "setkey", "mykeys", "delkey", "settings",
-    "batch", "createbatch", "searchbatch", "stopedit", "whtml", "testseries",
-    "tsr", "mocktest", "features", "gcast", "stopcast", "statses", "testapi",
-    "leaders", "aspirants", "limit", "listquiz", "removeuser",
-]
+# ============================================================
+# CONSTANTS
+# ============================================================
 
 MIN_QUESTIONS = 10
 MAX_QUESTIONS = 300
 MAX_QUESTIONS_OWNER = 3000
 
 
+_RESERVED_COMMANDS = [
+    "start",
+    "create",
+    "myquizzes",
+    "edit",
+    "info",
+    "ban",
+    "done",
+    "add",
+    "rem",
+    "remall",
+    "del",
+    "remove",
+    "clearlist",
+    "mywords",
+    "help",
+    "cancel",
+    "quiz",
+    "search",
+    "auth",
+    "pay",
+    "setpromo",
+    "setkey",
+    "mykeys",
+    "delkey",
+    "settings",
+    "batch",
+    "createbatch",
+    "searchbatch",
+    "stopedit",
+    "whtml",
+    "testseries",
+    "tsr",
+    "mocktest",
+    "features",
+    "gcast",
+    "stopcast",
+    "statses",
+    "testapi",
+    "leaders",
+    "aspirants",
+    "limit",
+    "listquiz",
+    "removeuser",
+]
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def _poll_text(value) -> Optional[str]:
+    """
+    Convert Pyrogram/Kurigram FormattedText or string into plain text.
+    """
+
+    if value is None:
+        return None
+
+    text = getattr(value, "text", None)
+
+    if text is not None:
+        return str(text)
+
+    return str(value)
+
+
 def _gen_qid() -> str:
     import random
     import string
 
-    return "GGN" + "".join(random.choices(string.ascii_uppercase + string.digits, k=6))
+    return "GGN" + "".join(
+        random.choices(
+            string.ascii_uppercase + string.digits,
+            k=6,
+        )
+    )
 
+
+def _safe_filename(filename: str) -> str:
+    """
+    Convert PDF filename into a reasonable quiz name.
+    """
+
+    name = os.path.basename(filename or "PDF Quiz")
+
+    if "." in name:
+        name = name.rsplit(".", 1)[0]
+
+    name = name.replace("_", " ")
+    name = name.replace("-", " ")
+
+    name = " ".join(name.split()).strip()
+
+    if not name:
+        name = "PDF Quiz"
+
+    return name[:150]
+
+
+# ============================================================
+# /CREATE
+# ============================================================
 
 @ratelimit("create")
 async def create_cmd(c: Client, m: Message) -> None:
-    """/create -- start a new quiz-creation session. Sends questions,
-    forwarded quiz polls, or a .txt file next; finish with /done."""
+    """
+    /create -- start manual quiz creation.
+    """
+
     if await subscribe_gate(c, m):
         return
+
     uid = m.from_user.id
+
     if not await is_premium_user(uid):
         await m.reply("🔒 Purchase premium: /pay")
         return
+
     if uid in state.quiz_creation:
-        await m.reply("⚠️ Already creating a quiz. Use /done or /cancel.")
+        await m.reply(
+            "⚠️ Already creating a quiz.\n"
+            "Use /done or /cancel."
+        )
         return
-    await m.reply("📝 **Send the quiz name.**")
+
+    await m.reply(
+        "📝 **Send the quiz name.**"
+    )
+
     state.quiz_creation[uid] = {
         "questions": [],
         "timer": None,
@@ -95,10 +192,18 @@ async def create_cmd(c: Client, m: Message) -> None:
     }
 
 
+# ============================================================
+# /CANCEL
+# ============================================================
+
 @ratelimit("default")
 async def cancel_cmd(c: Client, m: Message) -> None:
-    """/cancel -- discard the quiz currently being created."""
+    """
+    /cancel -- discard current quiz creation.
+    """
+
     uid = m.from_user.id
+
     if uid in state.quiz_creation:
         state.quiz_creation.pop(uid, None)
         await m.reply("❌ Cancelled.")
@@ -106,54 +211,126 @@ async def cancel_cmd(c: Client, m: Message) -> None:
         await m.reply("⚠️ Nothing to cancel.")
 
 
+# ============================================================
+# /DONE
+# ============================================================
+
 @ratelimit("create")
 async def done_cmd(c: Client, m: Message) -> None:
-    """/done -- finish and save the quiz being created (needs >= 10
-    questions). Offers a Quick Save shortcut when the creator has saved
-    defaults (see /settings)."""
+    """
+    /done -- finish manual quiz creation.
+    """
+
     uid = m.from_user.id
+
     if not await is_premium_user(uid):
         await m.reply("🔒 Purchase premium: /pay")
         return
+
     if uid not in state.quiz_creation:
         await m.reply("⚠️ Use /create first.")
         return
-    total = len(state.quiz_creation[uid]["questions"])
+
+    total = len(
+        state.quiz_creation[uid]["questions"]
+    )
+
     if total < MIN_QUESTIONS:
-        await m.reply(f"⚠️ Need at least {MIN_QUESTIONS} questions. You have {total}.")
+        await m.reply(
+            f"⚠️ Need at least {MIN_QUESTIONS} questions.\n"
+            f"You have {total}."
+        )
         return
-    max_allowed = MAX_QUESTIONS_OWNER if uid == config.OWNER_ID else MAX_QUESTIONS
+
+    max_allowed = (
+        MAX_QUESTIONS_OWNER
+        if uid == config.OWNER_ID
+        else MAX_QUESTIONS
+    )
+
     if total > max_allowed:
-        await m.reply(f"⚠️ Max {max_allowed} questions. You have {total}.")
+        await m.reply(
+            f"⚠️ Maximum {max_allowed} questions.\n"
+            f"You have {total}."
+        )
         return
 
     settings_repo = CreatorSettingsRepository(get_db())
     settings = await settings_repo.get(uid)
+
     quiz_defaults = settings.get("quiz_defaults") or {}
-    has_defaults = bool(quiz_defaults.get("type"))
+
+    has_defaults = bool(
+        quiz_defaults.get("type")
+    )
 
     if has_defaults:
-        typ = quiz_defaults.get("type", "free")
-        promo = quiz_defaults.get("promo") or None
-        section = quiz_defaults.get("section", "no")
-        promo_preview = (promo[:30] + "...") if promo and len(promo) > 30 else (promo or "none")
+
+        typ = quiz_defaults.get(
+            "type",
+            "free",
+        )
+
+        promo = (
+            quiz_defaults.get("promo")
+            or None
+        )
+
+        section = quiz_defaults.get(
+            "section",
+            "no",
+        )
+
+        promo_preview = (
+            promo[:30] + "..."
+            if promo and len(promo) > 30
+            else promo or "none"
+        )
+
         kb = InlineKeyboardMarkup(
             [
-                [InlineKeyboardButton("⚡ Use saved config", callback_data=f"qd_use_{uid}")],
-                [InlineKeyboardButton("📝 Manual setup", callback_data=f"qd_manual_{uid}")],
+                [
+                    InlineKeyboardButton(
+                        "⚡ Use saved config",
+                        callback_data=f"qd_use_{uid}",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        "📝 Manual setup",
+                        callback_data=f"qd_manual_{uid}",
+                    )
+                ],
             ]
         )
-        state.quiz_creation[uid]["_qd"] = quiz_defaults
+
+        state.quiz_creation[uid]["_qd"] = (
+            quiz_defaults
+        )
+
         await m.reply(
-            f"⚡ **Quick Save available!**\n\nType: `{typ}`\nPromo: `{promo_preview}`\nSections: `{section}`\n\n"
+            f"⚡ **Quick Save available!**\n\n"
+            f"Type: `{typ}`\n"
+            f"Promo: `{promo_preview}`\n"
+            f"Sections: `{section}`\n\n"
             f"Use the saved config, or set up manually?",
             reply_markup=kb,
         )
+
         return
 
-    await m.reply("📚 Section quiz? yes/no")
-    state.quiz_creation[uid]["awaiting_section_choice"] = True
+    await m.reply(
+        "📚 Section quiz? yes/no"
+    )
 
+    state.quiz_creation[uid][
+        "awaiting_section_choice"
+    ] = True
+
+
+# ============================================================
+# FINALIZE QUIZ
+# ============================================================
 
 async def _finalize_quiz(
     c: Client,
@@ -165,40 +342,107 @@ async def _finalize_quiz(
     timer: int,
     from_user_name: str,
 ) -> None:
-    """Save the in-progress quiz to the database and report the result.
-    `reply_target` is either a Message (creation flow) or a CallbackQuery
-    (Quick Save flow) -- we normalize both to a coroutine that sends text.
-    """
-    is_message = isinstance(reply_target, Message)
 
-    async def send_result(text: str, kb: Optional[InlineKeyboardMarkup] = None):
+    is_message = isinstance(
+        reply_target,
+        Message,
+    )
+
+    async def send_result(
+        text: str,
+        kb: Optional[InlineKeyboardMarkup] = None,
+    ):
         if is_message:
-            return await reply_target.reply(text, reply_markup=kb)
+            return await reply_target.reply(
+                text,
+                reply_markup=kb,
+            )
+
         try:
-            return await reply_target.message.edit_text(text, reply_markup=kb)
+            return await reply_target.message.edit_text(
+                text,
+                reply_markup=kb,
+            )
         except Exception:
-            return await reply_target.message.reply(text, reply_markup=kb)
+            return await reply_target.message.reply(
+                text,
+                reply_markup=kb,
+            )
 
-    quiz_name = state.quiz_creation[uid]["quiz_name"]
-    questions = state.quiz_creation[uid]["questions"]
+    if uid not in state.quiz_creation:
+        await send_result(
+            "⚠️ Quiz creation session expired."
+        )
+        return
 
-    settings_repo = CreatorSettingsRepository(get_db())
+    quiz_name = state.quiz_creation[uid][
+        "quiz_name"
+    ]
+
+    questions = state.quiz_creation[uid][
+        "questions"
+    ]
+
+    # --------------------------------------------------------
+    # Apply default text
+    # --------------------------------------------------------
+
+    settings_repo = CreatorSettingsRepository(
+        get_db()
+    )
+
     settings = await settings_repo.get(uid)
-    default_text = settings.get("default_text")
-    default_text_field = settings.get("default_text_field", "both")
+
+    default_text = settings.get(
+        "default_text"
+    )
+
+    default_text_field = settings.get(
+        "default_text_field",
+        "both",
+    )
+
     if default_text:
+
         for q in questions:
-            if default_text_field in ("question", "both") and q.get("question"):
-                q["question"] = q["question"].rstrip() + "\n" + default_text
-            if default_text_field in ("explanation", "both"):
-                q["explanation"] = (
-                    (q.get("explanation") or "").rstrip() + "\n" + default_text
-                    if q.get("explanation")
-                    else default_text
+
+            if (
+                default_text_field
+                in ("question", "both")
+                and q.get("question")
+            ):
+                q["question"] = (
+                    q["question"].rstrip()
+                    + "\n"
+                    + default_text
                 )
 
+            if (
+                default_text_field
+                in ("explanation", "both")
+            ):
+
+                if q.get("explanation"):
+                    q["explanation"] = (
+                        q["explanation"].rstrip()
+                        + "\n"
+                        + default_text
+                    )
+                else:
+                    q["explanation"] = (
+                        default_text
+                    )
+
+    # --------------------------------------------------------
+    # Create quiz
+    # --------------------------------------------------------
+
     qid = _gen_qid()
-    quiz_repo = QuizRepository(get_db())
+
+    quiz_repo = QuizRepository(
+        get_db()
+    )
+
     quiz = await quiz_repo.create(
         creator_id=uid,
         quiz_name=quiz_name,
@@ -210,405 +454,1630 @@ async def _finalize_quiz(
         negative_marks=0,
         promo_message=promo,
     )
-    state.quiz_creation.pop(uid, None)
+
+    state.quiz_creation.pop(
+        uid,
+        None,
+    )
 
     if not quiz:
-        await send_result("⚠️ Quiz created but could not be re-fetched. Try /myquizzes.")
+
+        await send_result(
+            "⚠️ Quiz created but could not be re-fetched.\n"
+            "Try /myquizzes."
+        )
+
         return
 
-    promo_flag = "Set" if promo else "None"
+    promo_flag = (
+        "Set"
+        if promo
+        else "None"
+    )
+
     text = (
         f"> 🎉 **Quiz Created!**\n\n"
-        f"\U0001F4DD **Name:** {quiz_name}\n"
+        f"📝 **Name:** {quiz_name}\n"
         f"❓ **Questions:** {len(quiz['questions'])}\n"
         f"⏱️ **Timer:** {timer}s\n"
         f"🆔 **Quiz ID:** `{qid}`\n"
-        f"\U0001F3F7 **Type:** `{quiz_type}`\n"
+        f"🏷 **Type:** `{quiz_type}`\n"
         f"🪭 **Promo:** {promo_flag}\n"
         f"👨‍💼 **Creator:** `{from_user_name}`"
     )
+
     if sections:
+
         text += "\n\n**Sections:**"
-        for i, sec in enumerate(sections, 1):
+
+        for i, sec in enumerate(
+            sections,
+            1,
+        ):
+
             text += (
-                f"\n\nSection {i}: {sec['name']}\n"
-                f"  Questions: {sec['question_range'][0]} to {sec['question_range'][1]}\n"
-                f"  Timer: {sec.get('timer', 'N/A')}s"
+                f"\n\nSection {i}: "
+                f"{sec['name']}\n"
+                f"  Questions: "
+                f"{sec['question_range'][0]} "
+                f"to "
+                f"{sec['question_range'][1]}\n"
+                f"  Timer: "
+                f"{sec.get('timer', 'N/A')}s"
             )
 
+    # --------------------------------------------------------
+    # Buttons
+    # --------------------------------------------------------
+
     me = await c.get_me()
+
     kb_buttons = [
-        [InlineKeyboardButton("🚀 Start", url=f"https://t.me/{me.username}?start={qid}")],
-        [InlineKeyboardButton("👥 Add to Group", url=f"https://t.me/{me.username}?startgroup={qid}")],
-        [InlineKeyboardButton("🔗 Share", switch_inline_query=qid)],
+        [
+            InlineKeyboardButton(
+                "🚀 Start",
+                url=(
+                    f"https://t.me/"
+                    f"{me.username}"
+                    f"?start={qid}"
+                ),
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "👥 Add to Group",
+                url=(
+                    f"https://t.me/"
+                    f"{me.username}"
+                    f"?startgroup={qid}"
+                ),
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "🔗 Share",
+                switch_inline_query=qid,
+            )
+        ],
     ]
-    # "Play" opens the visual Mini App player right here in this private
-    # chat -- a native web_app button, which Telegram only allows on
-    # messages sent directly to the user (exactly this context). Skipped
-    # entirely when MINI_APP_DOMAIN isn't configured.
-    play_practice = mini_app_web_app_button(me.username, qid, "practice", "Play (Practice)")
-    play_exam = mini_app_web_app_button(me.username, qid, "exam", "Play (Exam)")
+
+    play_practice = (
+        mini_app_web_app_button(
+            me.username,
+            qid,
+            "practice",
+            "Play (Practice)",
+        )
+    )
+
+    play_exam = (
+        mini_app_web_app_button(
+            me.username,
+            qid,
+            "exam",
+            "Play (Exam)",
+        )
+    )
+
     if play_practice and play_exam:
-        kb_buttons.append([play_practice, play_exam])
+
+        kb_buttons.append(
+            [
+                play_practice,
+                play_exam,
+            ]
+        )
+
     if quiz_type == "paid":
-        kb_buttons.append([InlineKeyboardButton("📦 Attach to Batch", callback_data=f"bat_attachqz_{qid}_{uid}")])
-    kb = InlineKeyboardMarkup(kb_buttons)
-    await send_result(text, kb)
+
+        kb_buttons.append(
+            [
+                InlineKeyboardButton(
+                    "📦 Attach to Batch",
+                    callback_data=(
+                        f"bat_attachqz_"
+                        f"{qid}_{uid}"
+                    ),
+                )
+            ]
+        )
+
+    kb = InlineKeyboardMarkup(
+        kb_buttons
+    )
+
+    await send_result(
+        text,
+        kb,
+    )
+
+    # --------------------------------------------------------
+    # Optional group announcement
+    # --------------------------------------------------------
 
     if config.BOT_GROUP:
+
         try:
-            announce_text = strip_source_noise(text) or text
-            await c.send_message(config.BOT_GROUP, announce_text, reply_markup=InlineKeyboardMarkup(kb_buttons[:3]))
+
+            announce_text = (
+                strip_source_noise(text)
+                or text
+            )
+
+            await c.send_message(
+                config.BOT_GROUP,
+                announce_text,
+                reply_markup=(
+                    InlineKeyboardMarkup(
+                        kb_buttons[:3]
+                    )
+                ),
+            )
+
         except Exception:
-            logger.debug("Failed to announce new quiz in BOT_GROUP", exc_info=True)
+
+            logger.debug(
+                "Failed to announce new quiz",
+                exc_info=True,
+            )
 
 
-async def quicksave_cb(c: Client, cb: CallbackQuery) -> None:
-    """`qd_use_<uid>` / `qd_manual_<uid>` -- Quick Save decision after
-    /done when the creator has saved quiz defaults."""
+# ============================================================
+# QUICK SAVE CALLBACK
+# ============================================================
+
+async def quicksave_cb(
+    c: Client,
+    cb: CallbackQuery,
+) -> None:
+
     uid = cb.from_user.id
-    action = cb.data.split("_")[1]
-    target = int(cb.data.split("_")[2])
+
+    parts = cb.data.split("_")
+
+    action = parts[1]
+    target = int(parts[2])
+
     if uid != target:
-        await cb.answer("❌ Not yours", show_alert=True)
+
+        await cb.answer(
+            "❌ Not yours",
+            show_alert=True,
+        )
+
         return
+
     if uid not in state.quiz_creation:
-        await cb.answer("⚠️ Session expired", show_alert=True)
+
+        await cb.answer(
+            "⚠️ Session expired",
+            show_alert=True,
+        )
+
         return
 
     if action == "manual":
+
         try:
-            await cb.message.edit_text("📚 Section quiz? yes/no")
+            await cb.message.edit_text(
+                "📚 Section quiz? yes/no"
+            )
         except Exception:
-            await cb.message.reply("📚 Section quiz? yes/no")
-        state.quiz_creation[uid]["awaiting_section_choice"] = True
+            await cb.message.reply(
+                "📚 Section quiz? yes/no"
+            )
+
+        state.quiz_creation[uid][
+            "awaiting_section_choice"
+        ] = True
+
         await cb.answer()
+
         return
 
-    quiz_defaults = state.quiz_creation[uid].get("_qd", {})
-    quiz_type = quiz_defaults.get("type", "free")
-    promo = quiz_defaults.get("promo") or None
-    section_choice = quiz_defaults.get("section", "no")
-    timer = state.quiz_creation[uid].get("timer") or 20
+    quiz_defaults = (
+        state.quiz_creation[uid]
+        .get("_qd", {})
+    )
 
-    await cb.answer("⚡ Saving...")
+    quiz_type = quiz_defaults.get(
+        "type",
+        "free",
+    )
+
+    promo = (
+        quiz_defaults.get("promo")
+        or None
+    )
+
+    section_choice = quiz_defaults.get(
+        "section",
+        "no",
+    )
+
+    timer = (
+        state.quiz_creation[uid]
+        .get("timer")
+        or 20
+    )
+
+    await cb.answer(
+        "⚡ Saving..."
+    )
+
     try:
-        await cb.message.edit_text("🚀 Creating quiz...")
+        await cb.message.edit_text(
+            "🚀 Creating quiz..."
+        )
     except Exception:
         pass
 
     if section_choice == "yes":
-        state.quiz_creation[uid]["section_wise"] = True
-        state.quiz_creation[uid]["promo_message"] = promo
-        state.quiz_creation[uid]["type_preset"] = quiz_type
-        state.quiz_creation[uid]["awaiting_section_count"] = True
+
+        state.quiz_creation[uid][
+            "section_wise"
+        ] = True
+
+        state.quiz_creation[uid][
+            "promo_message"
+        ] = promo
+
+        state.quiz_creation[uid][
+            "type_preset"
+        ] = quiz_type
+
+        state.quiz_creation[uid][
+            "awaiting_section_count"
+        ] = True
+
         try:
-            await cb.message.edit_text("📚 How many sections? (>= 2)")
+            await cb.message.edit_text(
+                "📚 How many sections? (>= 2)"
+            )
         except Exception:
-            await cb.message.reply("📚 How many sections? (>= 2)")
+            await cb.message.reply(
+                "📚 How many sections? (>= 2)"
+            )
+
         return
 
-    name = cb.from_user.first_name if cb.from_user else str(uid)
-    await _finalize_quiz(c, cb, uid, quiz_type, promo, [], timer, name)
+    name = (
+        cb.from_user.first_name
+        if cb.from_user
+        else str(uid)
+    )
+
+    await _finalize_quiz(
+        c,
+        cb,
+        uid,
+        quiz_type,
+        promo,
+        [],
+        timer,
+        name,
+    )
 
 
-async def handle_document(c: Client, m: Message) -> None:
-    """Handle a .txt/.json file sent while a quiz-creation session is
-    active -- imports questions in bulk (see handlers/file_import.py)."""
+# ============================================================
+# DIRECT PDF IMPORT
+# ============================================================
+
+async def handle_pdf_direct(
+    c: Client,
+    m: Message,
+) -> None:
+    """
+    DIRECT PDF -> QUESTIONS -> QUIZ
+
+    User sends a PDF directly to the creator bot.
+
+    No /create required.
+
+    No Telegram channel required.
+
+    No AI required.
+    """
+
     uid = m.from_user.id
+
+    # --------------------------------------------------------
+    # Premium check
+    # --------------------------------------------------------
+
+    if not await is_premium_user(uid):
+
+        await m.reply(
+            "🔒 PDF → Quiz creation is a premium feature.\n\n"
+            "Purchase premium: /pay"
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # Check PDF
+    # --------------------------------------------------------
+
+    filename = (
+        m.document.file_name
+        or "quiz.pdf"
+    )
+
+    mime_type = (
+        m.document.mime_type
+        or ""
+    )
+
+    if (
+        not filename.lower().endswith(".pdf")
+        and mime_type != "application/pdf"
+    ):
+
+        await m.reply(
+            "⚠️ Please send a PDF file."
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # Prevent simultaneous creation
+    # --------------------------------------------------------
+
+    if uid in state.quiz_creation:
+
+        await m.reply(
+            "⚠️ You already have a quiz creation session running.\n\n"
+            "Use /done or /cancel first."
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # Download PDF
+    # --------------------------------------------------------
+
+    status = await m.reply(
+        "📥 **Downloading PDF...**"
+    )
+
+    try:
+
+        file_bytes = await c.download_media(
+            m.document.file_id,
+            in_memory=True,
+        )
+
+        if file_bytes is None:
+
+            await status.edit_text(
+                "❌ Could not download the PDF."
+            )
+
+            return
+
+        file_bytes.seek(0)
+
+        content = file_bytes.read()
+
+    except Exception as e:
+
+        logger.exception(
+            "PDF download failed"
+        )
+
+        await status.edit_text(
+            "❌ PDF download failed.\n\n"
+            f"`{str(e)[:200]}`"
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # Parse PDF
+    # --------------------------------------------------------
+
+    try:
+
+        await status.edit_text(
+            "🔍 **Reading PDF...**\n"
+            "Extracting existing MCQs..."
+        )
+
+        questions = await process_uploaded_file(
+            content,
+            filename,
+            mime_type,
+            max_questions=(
+                MAX_QUESTIONS_OWNER
+                if uid == config.OWNER_ID
+                else MAX_QUESTIONS
+            ),
+        )
+
+    except Exception as e:
+
+        logger.exception(
+            "PDF parsing failed"
+        )
+
+        await status.edit_text(
+            "❌ Could not process the PDF.\n\n"
+            f"`{str(e)[:200]}`"
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # No questions
+    # --------------------------------------------------------
+
+    if not questions:
+
+        await status.edit_text(
+            "❌ **No MCQs found in this PDF.**\n\n"
+            "The PDF must contain text-based questions in a format such as:\n\n"
+            "1. Question?\n"
+            "A) Option 1\n"
+            "B) Option 2\n"
+            "C) Option 3\n"
+            "D) Option 4\n"
+            "ANSWER: A\n\n"
+            "⚠️ Scanned/image-only PDFs are not supported yet."
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # Minimum question check
+    # --------------------------------------------------------
+
+    if len(questions) < MIN_QUESTIONS:
+
+        await status.edit_text(
+            f"⚠️ Only **{len(questions)} MCQs** were found.\n\n"
+            f"At least **{MIN_QUESTIONS} questions** are required "
+            "to create a quiz."
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # Owner / normal limit
+    # --------------------------------------------------------
+
+    max_allowed = (
+        MAX_QUESTIONS_OWNER
+        if uid == config.OWNER_ID
+        else MAX_QUESTIONS
+    )
+
+    if len(questions) > max_allowed:
+
+        questions = questions[:max_allowed]
+
+    # --------------------------------------------------------
+    # Set quiz name
+    # --------------------------------------------------------
+
+    quiz_name = _safe_filename(
+        filename
+    )
+
+    # --------------------------------------------------------
+    # Initialize creation state
+    # --------------------------------------------------------
+
+    state.quiz_creation[uid] = {
+        "questions": questions,
+        "timer": 20,
+        "quiz_name": quiz_name,
+        "awaiting_name": False,
+    }
+
+    # --------------------------------------------------------
+    # AUTOMATIC QUIZ CREATION
+    #
+    # Defaults:
+    # type   = free
+    # timer  = 20 sec
+    # promo  = none
+    # section= none
+    # --------------------------------------------------------
+
+    await status.edit_text(
+        f"✅ **PDF processed successfully!**\n\n"
+        f"📝 Quiz: **{quiz_name}**\n"
+        f"❓ Questions found: **{len(questions)}**\n\n"
+        f"🚀 Creating quiz..."
+    )
+
+    try:
+
+        name = (
+            m.from_user.first_name
+            if m.from_user
+            else str(uid)
+        )
+
+        await _finalize_quiz(
+            c,
+            m,
+            uid,
+            "free",
+            None,
+            [],
+            20,
+            name,
+        )
+
+    except Exception as e:
+
+        logger.exception(
+            "Automatic PDF quiz creation failed"
+        )
+
+        state.quiz_creation.pop(
+            uid,
+            None,
+        )
+
+        await status.edit_text(
+            "❌ PDF was read, but quiz creation failed.\n\n"
+            f"`{str(e)[:300]}`"
+        )
+
+
+# ============================================================
+# MANUAL DOCUMENT IMPORT
+# ============================================================
+
+async def handle_document(
+    c: Client,
+    m: Message,
+) -> None:
+    """
+    Handle TXT / JSON / PDF files while /create wizard
+    is active.
+
+    PDF direct mode is handled separately.
+    """
+
+    uid = m.from_user.id
+
     if not await is_premium_user(uid):
         return
+
     if uid not in state.quiz_creation:
         return
-    allowed_types = ("text/plain", "application/json")
-    if m.document.mime_type not in allowed_types:
-        await m.reply("⚠️ Only .txt or .json files are supported for quiz questions.")
-        return
 
-    status = await m.reply("⏳ Processing...")
-    file_bytes = await c.download_media(m.document.file_id, in_memory=True)
-    file_bytes.seek(0)
-    content = file_bytes.read()
-
-    user = await UserRepository(get_db()).get_or_create(uid)
-    remove_words = user.get("remove_words", [])
-
-    count, error = process_uploaded_file(
-        content, m.document.file_name or "upload.txt", state.quiz_creation[uid]["questions"], remove_words
+    filename = (
+        m.document.file_name
+        or ""
     )
-    if error:
-        await status.edit_text(f"❌ Error: {error}")
-    else:
-        total = len(state.quiz_creation[uid]["questions"])
-        await status.edit_text(f"✅ {count} questions processed! Total: {total}\nSend more or /done")
+
+    mime_type = (
+        m.document.mime_type
+        or ""
+    )
+
+    # Direct PDF should normally be handled by
+    # handle_pdf_direct before this handler.
+    if (
+        filename.lower().endswith(".pdf")
+        or mime_type == "application/pdf"
+    ):
+
+        await m.reply(
+            "⚠️ A PDF is already handled automatically.\n"
+            "Please send it outside the /create session, "
+            "or use /cancel first."
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # TXT / JSON only in manual wizard
+    # --------------------------------------------------------
+
+    allowed = (
+        filename.lower().endswith(".txt")
+        or filename.lower().endswith(".json")
+        or mime_type.startswith("text/")
+        or mime_type == "application/json"
+        or mime_type.endswith("+json")
+    )
+
+    if not allowed:
+
+        await m.reply(
+            "⚠️ Supported files:\n"
+            "• PDF\n"
+            "• TXT\n"
+            "• JSON"
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # Download
+    # --------------------------------------------------------
+
+    status = await m.reply(
+        "⏳ Processing file..."
+    )
+
+    try:
+
+        file_bytes = await c.download_media(
+            m.document.file_id,
+            in_memory=True,
+        )
+
+        if file_bytes is None:
+
+            await status.edit_text(
+                "❌ Could not download the file."
+            )
+
+            return
+
+        file_bytes.seek(0)
+
+        content = file_bytes.read()
+
+    except Exception as e:
+
+        logger.exception(
+            "File download failed"
+        )
+
+        await status.edit_text(
+            "❌ File download failed."
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # Parse
+    # --------------------------------------------------------
+
+    try:
+
+        parsed = await process_uploaded_file(
+            content,
+            filename,
+            mime_type,
+            max_questions=(
+                MAX_QUESTIONS_OWNER
+                if uid == config.OWNER_ID
+                else MAX_QUESTIONS
+            ),
+        )
+
+    except Exception as e:
+
+        logger.exception(
+            "File processing failed"
+        )
+
+        await status.edit_text(
+            f"❌ Processing error:\n`{str(e)[:300]}`"
+        )
+
+        return
+
+    if not parsed:
+
+        await status.edit_text(
+            "❌ No valid questions found in the file."
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # Add to current quiz
+    # --------------------------------------------------------
+
+    state.quiz_creation[uid][
+        "questions"
+    ].extend(parsed)
+
+    total = len(
+        state.quiz_creation[uid][
+            "questions"
+        ]
+    )
+
+    await status.edit_text(
+        f"✅ **{len(parsed)} questions imported!**\n\n"
+        f"Total questions: **{total}**\n\n"
+        f"Send more or use `/done`."
+    )
 
 
-async def handle_creation_message(c: Client, m: Message) -> None:
-    """Drives every text/poll step of the quiz-creation wizard: quiz name,
-    section setup, promo message, type selection, and free-text question
-    parsing (paste format or forwarded quiz polls)."""
-    uid, cid = m.from_user.id, m.chat.id
+# ============================================================
+# CREATION MESSAGE HANDLER
+# ============================================================
+
+async def handle_creation_message(
+    c: Client,
+    m: Message,
+) -> None:
+
+    uid = m.from_user.id
+    cid = m.chat.id
+
     if uid not in state.quiz_creation:
         return
+
     ud = state.quiz_creation[uid]
 
+    # --------------------------------------------------------
+    # FORWARDED QUIZ POLL
+    # --------------------------------------------------------
+
     if m.poll:
+
         poll = m.poll
+
         if poll.type != PollType.QUIZ:
-            await m.reply("⚠️ Only quiz-type polls are supported.")
+
+            await m.reply(
+                "⚠️ Only quiz-type polls are supported."
+            )
+
             return
-        user = await UserRepository(get_db()).get_or_create(uid)
-        remove_words = user.get("remove_words", [])
-        question = strip_source_noise(filter_words(_poll_text(poll.question), remove_words))
-        options = [filter_words(_poll_text(o.text), remove_words) for o in poll.options]
-        # Confirmed via live log against this Kurigram build: a closed quiz
-        # poll (the normal state of a poll someone forwards to the bot)
-        # exposes the correct answer as `correct_option_id` -- SINGULAR,
-        # a plain int -- not `correct_option_ids` (plural/list). The plural
-        # attribute simply doesn't exist on this object at all, so the
-        # previous getattr(poll, "correct_option_ids", ...) silently and
-        # always fell through to 0, which is why every imported poll ended
-        # up marking option 1 (index 0) as correct regardless of the
-        # poll's real checkmark.
-        correct_id = getattr(poll, "correct_option_id", None)
+
+        user = await UserRepository(
+            get_db()
+        ).get_or_create(uid)
+
+        remove_words = user.get(
+            "remove_words",
+            [],
+        )
+
+        question = strip_source_noise(
+            filter_words(
+                _poll_text(
+                    poll.question
+                ),
+                remove_words,
+            )
+        )
+
+        options = [
+            filter_words(
+                _poll_text(o.text),
+                remove_words,
+            )
+            for o in poll.options
+        ]
+
+        correct_id = getattr(
+            poll,
+            "correct_option_id",
+            None,
+        )
+
         if correct_id is None:
-            # Defensive fallback for any future/older Kurigram build that
-            # instead reports the plural, list-shaped attribute.
-            correct_ids = getattr(poll, "correct_option_ids", None) or []
-            correct_id = correct_ids[0] if correct_ids else 0
+
+            correct_ids = getattr(
+                poll,
+                "correct_option_ids",
+                None,
+            ) or []
+
+            correct_id = (
+                correct_ids[0]
+                if correct_ids
+                else 0
+            )
+
         explanation = None
-        if getattr(poll, "explanation", None):
-            explanation = strip_source_noise(filter_words(_poll_text(poll.explanation), remove_words))
+
+        if getattr(
+            poll,
+            "explanation",
+            None,
+        ):
+
+            explanation = strip_source_noise(
+                filter_words(
+                    _poll_text(
+                        poll.explanation
+                    ),
+                    remove_words,
+                )
+            )
+
         reply_msg = m.reply_to_message
-        reply_text = reply_msg.text if reply_msg and reply_msg.text else None
+
+        reply_text = (
+            reply_msg.text
+            if reply_msg and reply_msg.text
+            else None
+        )
+
         file_id = None
-        if reply_msg and reply_msg.photo and config.BOT_GROUP:
+
+        if (
+            reply_msg
+            and reply_msg.photo
+            and config.BOT_GROUP
+        ):
+
             try:
-                copied = await c.copy_message(config.BOT_GROUP, reply_msg.chat.id, reply_msg.id)
-                file_id = copied.photo.file_id
+
+                copied = await c.copy_message(
+                    config.BOT_GROUP,
+                    reply_msg.chat.id,
+                    reply_msg.id,
+                )
+
+                file_id = (
+                    copied.photo.file_id
+                )
+
             except Exception:
-                logger.debug("Failed to copy poll's reply photo", exc_info=True)
+
+                logger.debug(
+                    "Failed to copy poll reply photo",
+                    exc_info=True,
+                )
+
         ud["questions"].append(
             {
-                "question": question, "options": options, "correct_option_id": correct_id,
-                "explanation": explanation, "file_id": file_id, "reply_text": reply_text,
+                "question": question,
+                "options": options,
+                "correct_option_id": correct_id,
+                "explanation": explanation,
+                "file_id": file_id,
+                "reply_text": reply_text,
             }
         )
-        await m.reply(f"✅ {len(ud['questions'])} saved! Send more or /done")
+
+        await m.reply(
+            f"✅ {len(ud['questions'])} saved!\n"
+            "Send more or /done"
+        )
+
         return
+
+    # --------------------------------------------------------
+    # TEXT
+    # --------------------------------------------------------
 
     if not m.text:
         return
 
+    # --------------------------------------------------------
+    # QUIZ NAME
+    # --------------------------------------------------------
+
     if ud.get("awaiting_name"):
+
         name = m.text.strip()
+
         if not name:
-            await m.reply("⚠️ Invalid name.")
+
+            await m.reply(
+                "⚠️ Invalid name."
+            )
+
             return
+
         ud["quiz_name"] = name
+
         ud["awaiting_name"] = False
-        await m.reply(f"📝 Name: **{name}**\nSend questions, forward quiz polls, or a .txt file. /cancel to abort.")
+
+        await m.reply(
+            f"📝 Name: **{name}**\n\n"
+            "Send questions, forward quiz polls, "
+            "or send a TXT/JSON file.\n\n"
+            "/cancel to abort."
+        )
+
         return
 
-    if ud.get("awaiting_section_choice"):
-        choice = m.text.strip().lower()
-        if choice not in ("yes", "no"):
-            await m.reply("⚠️ Reply yes or no.")
+    # --------------------------------------------------------
+    # SECTION CHOICE
+    # --------------------------------------------------------
+
+    if ud.get(
+        "awaiting_section_choice"
+    ):
+
+        choice = (
+            m.text.strip().lower()
+        )
+
+        if choice not in (
+            "yes",
+            "no",
+        ):
+
+            await m.reply(
+                "⚠️ Reply yes or no."
+            )
+
             return
-        ud["section_wise"] = choice == "yes"
-        del ud["awaiting_section_choice"]
+
+        ud["section_wise"] = (
+            choice == "yes"
+        )
+
+        del ud[
+            "awaiting_section_choice"
+        ]
+
         if ud["section_wise"]:
-            ud["awaiting_section_count"] = True
-            await m.reply("📚 How many sections? (>1)")
+
+            ud[
+                "awaiting_section_count"
+            ] = True
+
+            await m.reply(
+                "📚 How many sections? (>1)"
+            )
+
         else:
+
             ud["timer"] = 20
+
             ud["awaiting_promo"] = True
-            await m.reply("📢 Send your promo message (shown periodically). Send 'skip' or 'no' to leave empty.")
+
+            await m.reply(
+                "📢 Send your promo message.\n"
+                "Send `skip` or `no` to leave empty."
+            )
+
         return
 
-    if ud.get("awaiting_section_count"):
+    # --------------------------------------------------------
+    # SECTION COUNT
+    # --------------------------------------------------------
+
+    if ud.get(
+        "awaiting_section_count"
+    ):
+
         try:
-            section_count = int(m.text.strip())
+
+            section_count = int(
+                m.text.strip()
+            )
+
             if section_count < 2:
                 raise ValueError
+
         except ValueError:
-            await m.reply("⚠️ Enter a number >= 2.")
+
+            await m.reply(
+                "⚠️ Enter a number >= 2."
+            )
+
             return
-        ud["section_count"] = section_count
+
+        ud["section_count"] = (
+            section_count
+        )
+
         ud["sections"] = []
+
         ud["current_section"] = 1
+
         ud["last_range_end"] = 0
-        del ud["awaiting_section_count"]
-        ud["awaiting_section_name"] = True
-        await m.reply("📚 Section 1 name:")
+
+        del ud[
+            "awaiting_section_count"
+        ]
+
+        ud[
+            "awaiting_section_name"
+        ] = True
+
+        await m.reply(
+            "📚 Section 1 name:"
+        )
+
         return
 
-    if ud.get("awaiting_section_name"):
+    # --------------------------------------------------------
+    # SECTION NAME
+    # --------------------------------------------------------
+
+    if ud.get(
+        "awaiting_section_name"
+    ):
+
         name = m.text.strip()
+
         if not name:
-            await m.reply("⚠️ Invalid name.")
+
+            await m.reply(
+                "⚠️ Invalid name."
+            )
+
             return
-        ud["sections"].append({"name": name})
-        del ud["awaiting_section_name"]
-        ud["awaiting_question_range"] = True
-        await m.reply(f"📚 Range for '{name}' (e.g. 1-5). Max: {len(ud['questions'])}")
+
+        ud["sections"].append(
+            {
+                "name": name
+            }
+        )
+
+        del ud[
+            "awaiting_section_name"
+        ]
+
+        ud[
+            "awaiting_question_range"
+        ] = True
+
+        await m.reply(
+            f"📚 Range for '{name}' "
+            f"(e.g. 1-5).\n"
+            f"Max: {len(ud['questions'])}"
+        )
+
         return
 
-    if ud.get("awaiting_question_range"):
+    # --------------------------------------------------------
+    # QUESTION RANGE
+    # --------------------------------------------------------
+
+    if ud.get(
+        "awaiting_question_range"
+    ):
+
         try:
-            start, end = map(int, m.text.strip().split("-"))
-            total = len(ud["questions"])
-            if not (start >= 1 and end <= total and start <= end):
+
+            start, end = map(
+                int,
+                m.text.strip().split("-"),
+            )
+
+            total = len(
+                ud["questions"]
+            )
+
+            if not (
+                start >= 1
+                and end <= total
+                and start <= end
+            ):
                 raise ValueError
-            if ud["last_range_end"] and start != ud["last_range_end"] + 1:
+
+            if (
+                ud["last_range_end"]
+                and start
+                != ud["last_range_end"] + 1
+            ):
                 raise ValueError
+
         except ValueError:
-            await m.reply("⚠️ Invalid range.")
+
+            await m.reply(
+                "⚠️ Invalid range."
+            )
+
             return
-        ud["sections"][-1]["question_range"] = (start, end)
-        del ud["awaiting_question_range"]
+
+        ud["sections"][-1][
+            "question_range"
+        ] = (
+            start,
+            end,
+        )
+
+        del ud[
+            "awaiting_question_range"
+        ]
+
         ud["last_range_end"] = end
-        ud["awaiting_section_timer"] = True
-        await m.reply("⏱️ Section timer in seconds (>10):")
+
+        ud[
+            "awaiting_section_timer"
+        ] = True
+
+        await m.reply(
+            "⏱️ Section timer in seconds (>10):"
+        )
+
         return
 
-    if ud.get("awaiting_section_timer"):
+    # --------------------------------------------------------
+    # SECTION TIMER
+    # --------------------------------------------------------
+
+    if ud.get(
+        "awaiting_section_timer"
+    ):
+
         try:
-            timer = int(m.text.strip())
+
+            timer = int(
+                m.text.strip()
+            )
+
             if timer <= 10:
                 raise ValueError
+
         except ValueError:
-            await m.reply("⚠️ Enter a number > 10.")
+
+            await m.reply(
+                "⚠️ Enter a number > 10."
+            )
+
             return
-        ud["sections"][-1]["timer"] = timer
-        del ud["awaiting_section_timer"]
-        if len(ud["sections"]) < ud["section_count"]:
-            ud["current_section"] += 1
-            ud["awaiting_section_name"] = True
-            await m.reply(f"📚 Section {ud['current_section']} name:")
+
+        ud["sections"][-1][
+            "timer"
+        ] = timer
+
+        del ud[
+            "awaiting_section_timer"
+        ]
+
+        if (
+            len(ud["sections"])
+            < ud["section_count"]
+        ):
+
+            ud[
+                "current_section"
+            ] += 1
+
+            ud[
+                "awaiting_section_name"
+            ] = True
+
+            await m.reply(
+                f"📚 Section "
+                f"{ud['current_section']} name:"
+            )
+
         else:
-            ud["awaiting_promo"] = True
-            await m.reply("📢 Send your promo message (shown periodically). Send 'skip' or 'no' to leave empty.")
+
+            ud[
+                "awaiting_promo"
+            ] = True
+
+            await m.reply(
+                "📢 Send your promo message.\n"
+                "Send `skip` or `no` to leave empty."
+            )
+
         return
 
-    if ud.get("awaiting_promo"):
-        promo_text = m.text.strip()
-        ud["promo_message"] = None if promo_text.lower() in ("skip", "no", "none", "/skip") else promo_text
-        del ud["awaiting_promo"]
+    # --------------------------------------------------------
+    # PROMO
+    # --------------------------------------------------------
 
-        settings_repo = CreatorSettingsRepository(get_db())
-        settings = await settings_repo.get(uid)
-        default_text = settings.get("default_text")
-        default_text_field = settings.get("default_text_field", "both")
+    if ud.get(
+        "awaiting_promo"
+    ):
+
+        promo_text = m.text.strip()
+
+        ud["promo_message"] = (
+            None
+            if promo_text.lower()
+            in (
+                "skip",
+                "no",
+                "none",
+                "/skip",
+            )
+            else promo_text
+        )
+
+        del ud[
+            "awaiting_promo"
+        ]
+
+        settings_repo = (
+            CreatorSettingsRepository(
+                get_db()
+            )
+        )
+
+        settings = await settings_repo.get(
+            uid
+        )
+
+        default_text = settings.get(
+            "default_text"
+        )
+
+        default_text_field = settings.get(
+            "default_text_field",
+            "both",
+        )
+
         if default_text:
-            field_labels = {"question": "questions", "explanation": "explanations", "both": "questions & explanations"}
-            ud["awaiting_default_text_confirm"] = True
+
+            field_labels = {
+                "question": "questions",
+                "explanation": "explanations",
+                "both": "questions & explanations",
+            }
+
+            ud[
+                "awaiting_default_text_confirm"
+            ] = True
+
             ud["_dt"] = default_text
-            ud["_dtf"] = default_text_field
+
+            ud["_dtf"] = (
+                default_text_field
+            )
+
             kb = InlineKeyboardMarkup(
                 [
                     [
-                        InlineKeyboardButton("✅ Yes, add it", callback_data=f"dtc_yes_{uid}"),
-                        InlineKeyboardButton("⏭️ Skip", callback_data=f"dtc_no_{uid}"),
+                        InlineKeyboardButton(
+                            "✅ Yes, add it",
+                            callback_data=(
+                                f"dtc_yes_{uid}"
+                            ),
+                        ),
+                        InlineKeyboardButton(
+                            "⏭️ Skip",
+                            callback_data=(
+                                f"dtc_no_{uid}"
+                            ),
+                        ),
                     ]
                 ]
             )
+
             await m.reply(
-                f"💡 **Add default text to {field_labels.get(default_text_field, 'fields')}?**\n\n`{default_text[:100]}`",
+                "💡 **Add default text to "
+                f"{field_labels.get(default_text_field, 'fields')}?**\n\n"
+                f"`{default_text[:100]}`",
                 reply_markup=kb,
             )
+
             return
-        ud["awaiting_type"] = True
-        await m.reply("📊 Type (free/paid)")
+
+        ud[
+            "awaiting_type"
+        ] = True
+
+        await m.reply(
+            "📊 Type (free/paid)"
+        )
+
         return
 
-    if ud.get("awaiting_default_text_confirm"):
-        return  # handled via the dtc_yes/dtc_no callback
+    # --------------------------------------------------------
+    # DEFAULT TEXT CONFIRMATION
+    # --------------------------------------------------------
 
-    if ud.get("awaiting_type"):
-        quiz_type = m.text.strip().lower()
-        if quiz_type not in ("free", "paid"):
-            await m.reply("⚠️ Reply free or paid.")
-            return
-        timer = ud.get("timer") or 20
-        sections = ud.get("sections", [])
-        promo = ud.get("promo_message")
-        name = m.from_user.first_name if m.from_user else str(uid)
-        await _finalize_quiz(c, m, uid, quiz_type, promo, sections, timer, name)
+    if ud.get(
+        "awaiting_default_text_confirm"
+    ):
+
         return
 
-    # ── Free-text question paste ──────────────────────────────────────
-    blocks = m.text.split("\n\n")
-    reply_msg = m.reply_to_message
-    reply_text = reply_msg.text if reply_msg and reply_msg.text else None
+    # --------------------------------------------------------
+    # QUIZ TYPE
+    # --------------------------------------------------------
+
+    if ud.get(
+        "awaiting_type"
+    ):
+
+        quiz_type = (
+            m.text.strip().lower()
+        )
+
+        if quiz_type not in (
+            "free",
+            "paid",
+        ):
+
+            await m.reply(
+                "⚠️ Reply free or paid."
+            )
+
+            return
+
+        timer = (
+            ud.get("timer")
+            or 20
+        )
+
+        sections = ud.get(
+            "sections",
+            [],
+        )
+
+        promo = ud.get(
+            "promo_message"
+        )
+
+        name = (
+            m.from_user.first_name
+            if m.from_user
+            else str(uid)
+        )
+
+        await _finalize_quiz(
+            c,
+            m,
+            uid,
+            quiz_type,
+            promo,
+            sections,
+            timer,
+            name,
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # FREE TEXT QUESTIONS
+    # --------------------------------------------------------
+
+    blocks = m.text.split(
+        "\n\n"
+    )
+
+    reply_msg = (
+        m.reply_to_message
+    )
+
+    reply_text = (
+        reply_msg.text
+        if reply_msg
+        and reply_msg.text
+        else None
+    )
+
     file_id = None
-    if reply_msg and reply_msg.photo and config.BOT_GROUP:
+
+    if (
+        reply_msg
+        and reply_msg.photo
+        and config.BOT_GROUP
+    ):
+
         try:
-            copied = await c.copy_message(config.BOT_GROUP, reply_msg.chat.id, reply_msg.id)
-            file_id = copied.photo.file_id
+
+            copied = await c.copy_message(
+                config.BOT_GROUP,
+                reply_msg.chat.id,
+                reply_msg.id,
+            )
+
+            file_id = (
+                copied.photo.file_id
+            )
+
         except Exception:
-            logger.debug("Failed to copy pasted question's reply photo", exc_info=True)
+
+            logger.debug(
+                "Failed to copy pasted question photo",
+                exc_info=True,
+            )
 
     parsed_any = False
+
     for block in blocks:
+
         if not block.strip():
             continue
-        parsed = parse_question_block(block)
+
+        parsed = parse_question_block(
+            block
+        )
+
         if not parsed:
+
             await m.reply(
-                "⚠️ Invalid format.\n\nMark the correct option with a check-mark emoji. "
-                "For multi-line questions, put a lone emoji on its own line before the options, "
-                "or start each option with A) B) C) D)."
+                "⚠️ Invalid format.\n\n"
+                "Use:\n"
+                "1. Question?\n"
+                "A) Option 1\n"
+                "B) Option 2\n"
+                "C) Option 3\n"
+                "D) Option 4\n"
+                "ANSWER: A"
             )
+
             return
+
         parsed["file_id"] = file_id
         parsed["reply_text"] = reply_text
-        ud["questions"].append(parsed)
+
+        ud["questions"].append(
+            parsed
+        )
+
         parsed_any = True
 
     if not parsed_any:
-        await m.reply("⚠️ No valid question found.")
+
+        await m.reply(
+            "⚠️ No valid question found."
+        )
+
         return
-    total = len(ud["questions"])
-    suffix = " Consider stopping soon." if total > 200 else " Send more or /done"
-    await m.reply(f"✅ {total} saved!{suffix}")
+
+    total = len(
+        ud["questions"]
+    )
+
+    suffix = (
+        " Consider stopping soon."
+        if total > 200
+        else " Send more or /done"
+    )
+
+    await m.reply(
+        f"✅ {total} saved!{suffix}"
+    )
 
 
-async def default_text_confirm_cb(c: Client, cb: CallbackQuery) -> None:
-    """`dtc_yes_<uid>` / `dtc_no_<uid>` -- confirm whether to apply the
-    creator's saved default text before proceeding to type selection."""
+# ============================================================
+# DEFAULT TEXT CALLBACK
+# ============================================================
+
+async def default_text_confirm_cb(
+    c: Client,
+    cb: CallbackQuery,
+) -> None:
+
     uid = cb.from_user.id
+
     action = cb.data.split("_")[1]
+
     if uid not in state.quiz_creation:
-        await cb.answer("⚠️ Session expired", show_alert=True)
+
+        await cb.answer(
+            "⚠️ Session expired",
+            show_alert=True,
+        )
+
         return
+
     ud = state.quiz_creation[uid]
-    ud.pop("awaiting_default_text_confirm", None)
+
+    ud.pop(
+        "awaiting_default_text_confirm",
+        None,
+    )
+
     if action == "no":
-        ud.pop("_dt", None)
-        ud.pop("_dtf", None)
-    ud["awaiting_type"] = True
-    await cb.message.reply("📊 Type (free/paid)")
+
+        ud.pop(
+            "_dt",
+            None,
+        )
+
+        ud.pop(
+            "_dtf",
+            None,
+        )
+
+    ud[
+        "awaiting_type"
+    ] = True
+
+    await cb.message.reply(
+        "📊 Type (free/paid)"
+    )
+
     await cb.answer()
 
 
+# ============================================================
+# FILTER
+# ============================================================
+
 def in_quiz_creation_filter():
-    async def func(_, __, m: Message) -> bool:
-        return bool(m.from_user) and m.from_user.id in state.quiz_creation
+
+    async def func(
+        _,
+        __,
+        m: Message,
+    ):
+
+        return (
+            bool(m.from_user)
+            and m.from_user.id
+            in state.quiz_creation
+        )
 
     return filters.create(func)
 
 
+# ============================================================
+# REGISTER HANDLERS
+# ============================================================
+
 def register(app: Client) -> None:
-    app.on_message(filters.command("create") & filters.private)(create_cmd)
-    app.on_message(filters.command("done") & filters.private)(done_cmd)
-    app.on_message(filters.command("cancel") & filters.private)(cancel_cmd)
-    app.on_callback_query(filters.regex(r"^qd_(use|manual)_\d+$"))(quicksave_cb)
-    app.on_callback_query(filters.regex(r"^dtc_(yes|no)_\d+$"))(default_text_confirm_cb)
-    app.on_message(filters.document & filters.private & in_quiz_creation_filter())(handle_document)
+
+    # Commands
+    app.on_message(
+        filters.command("create")
+        & filters.private
+    )(create_cmd)
+
+    app.on_message(
+        filters.command("done")
+        & filters.private
+    )(done_cmd)
+
+    app.on_message(
+        filters.command("cancel")
+        & filters.private
+    )(cancel_cmd)
+
+    # --------------------------------------------------------
+    # Callbacks
+    # --------------------------------------------------------
+
+    app.on_callback_query(
+        filters.regex(
+            r"^qd_(use|manual)_\d+$"
+        )
+    )(quicksave_cb)
+
+    app.on_callback_query(
+        filters.regex(
+            r"^dtc_(yes|no)_\d+$"
+        )
+    )(default_text_confirm_cb)
+
+    # --------------------------------------------------------
+    # IMPORTANT:
+    # DIRECT PDF HANDLER
+    #
+    # This is registered BEFORE the wizard document handler.
+    # --------------------------------------------------------
+
+    app.on_message(
+        filters.document
+        & filters.private
+        & filters.regex(
+            r"(?i)\.pdf$",
+            "document.file_name",
+        )
+    )(handle_pdf_direct)
+
+    # MIME fallback for PDFs whose filename does not end in .pdf
+    app.on_message(
+        filters.document
+        & filters.private
+        & filters.regex(
+            r"^application/pdf$",
+            "document.mime_type",
+        )
+    )(handle_pdf_direct)
+
+    # --------------------------------------------------------
+    # TXT / JSON inside /create
+    # --------------------------------------------------------
+
+    app.on_message(
+        filters.document
+        & filters.private
+        & in_quiz_creation_filter()
+    )(handle_document)
+
+    # --------------------------------------------------------
+    # Text / poll creation wizard
+    # --------------------------------------------------------
+
     app.on_message(
         (filters.text | filters.poll)
         & filters.private
         & in_quiz_creation_filter()
-        & ~filters.command(_RESERVED_COMMANDS)
+        & ~filters.command(
+            _RESERVED_COMMANDS
+        )
     )(handle_creation_message)
