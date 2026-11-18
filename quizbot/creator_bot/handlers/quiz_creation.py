@@ -803,7 +803,14 @@ async def handle_pdf_direct(
     # --------------------------------------------------------
     # Premium check
     # --------------------------------------------------------
+
     if uid != config.OWNER_ID and not await is_premium_user(uid):
+        await m.reply(
+            "🔒 PDF → Quiz creation is a premium feature.\n\n"
+            "Purchase premium: /pay"
+        )
+        return
+
     # --------------------------------------------------------
     # Check PDF
     # --------------------------------------------------------
