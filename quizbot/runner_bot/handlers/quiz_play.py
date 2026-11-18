@@ -17,7 +17,7 @@ from typing import Any, Optional
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Poll, Update
 from telegram.constants import ChatType, ParseMode
-from telegram.ext import Application, CommandHandler, ContextTypes, PollAnswerHandler
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, PollAnswerHandler
 
 from quizbot.database import (
     AttemptRepository,
@@ -288,7 +288,7 @@ async def send_private_question(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE, id
             _q_text, options, correct_ids[0], q.get("explanation"), _rt, idx, len(questions)
         )
         if rich_res.poll_options_override:
-            poll_opts = rich_res.poll_options_override
+                        poll_opts = rich_res.poll_options_override
         if rich_res.suppress_description:
             poll_desc = None
             overflow = None
@@ -320,10 +320,14 @@ async def send_private_question(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE, id
         # player's own user id, so this comparison is exact.
         protect = not (chat_id == s["quiz_data"].get("creator_id"))
 
+        stop_markup = InlineKeyboardMarkup([[
+            InlineKeyboardButton("🛑 Stop Quiz", callback_data="quiz_stop")
+        ]])
+
         poll_msg = await safe_send_poll(
             ctx, chat_id, question=poll_q, options=poll_opts, type=Poll.QUIZ,
             explanation=poll_expl, is_anonymous=False, open_period=timer,
-            protect_content=protect, **poll_kwargs,
+            protect_content=protect, reply_markup=stop_markup, **poll_kwargs,
         )
 
         if poll_msg:
@@ -573,8 +577,7 @@ async def _run_sectioned_quiz(chat_id, ctx, questions, quiz, sections, protect, 
         global_neg = quiz.get("negative_marking", 0)
         sec_cm = section.get("correct_mark", global_cm)
         sec_neg = section.get("neg_mark", global_neg)
-
-        sec_msg = await safe_send_message(
+                sec_msg = await safe_send_message(
             ctx, chat_id,
             f"\U0001F4DA <b>{sec_name}</b>\n\U0001F4CB Q{start_q}–{end_q}  ({n_qs_sec} questions)\n"
             f"{mode_lbl}  ·  Marks: +{sec_cm} / -{sec_neg}",
@@ -753,10 +756,14 @@ async def _send_group_question(chat_id, ctx, questions, idx, total, base_timer, 
         if poll_desc:
             poll_kwargs["description"] = poll_desc
 
+        stop_markup = InlineKeyboardMarkup([[
+            InlineKeyboardButton("🛑 Stop Quiz", callback_data="quiz_stop")
+        ]])
+
         poll_msg = await safe_send_poll(
             ctx, chat_id, question=poll_q, options=poll_opts, type=Poll.QUIZ,
             explanation=poll_expl, is_anonymous=False, open_period=timer if timer > 0 else None,
-            protect_content=protect, **poll_kwargs,
+            protect_content=protect, reply_markup=stop_markup, **poll_kwargs,
         )
 
         if poll_msg:
@@ -859,8 +866,7 @@ async def _send_explanation_after_poll(ctx: ContextTypes.DEFAULT_TYPE, chat_id: 
         kw: dict[str, Any] = {}
         if thread_id:
             kw["message_thread_id"] = thread_id
-
-        if _is_rich(expl):
+                    if _is_rich(expl):
             body = _normalise_math_spacing(f"\U0001F4A1 **Explanation:**\n\n{expl}")
             await send_rich_or_fallback(
                 lambda method, params: send_raw_api(ctx, method, params),
@@ -1149,7 +1155,7 @@ async def _record_attempt_and_report(
 
     if chat_settings["pdf_enabled"]:
         await _send_pdf_report(ctx, chat_id, quiz_data, chat_title, leaderboard, session_polls=None, thread_id=thread_id)
-
+        
 
 async def _send_pdf_report(
     ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, quiz_data: dict, chat_title: str,
@@ -1241,11 +1247,10 @@ async def start_quiz(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
         user_id = update.message.from_user.id
 
-            if not await rate_limiter.check(user_id):
+        if not await rate_limiter.check(user_id):
             await safe_send_message(ctx, chat_id, "⏱️ Too many requests. Wait a moment.")
             return
 
-      
 
         if not ctx.args:
             welcome = (
@@ -1383,6 +1388,66 @@ async def _send_access_denied(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, quiz
             await safe_send_message(ctx, chat_id, f"❌ Contact the quiz creator for access.\n\n{details}")
         except Exception:
             await safe_send_message(ctx, chat_id, f"❌ Contact creator ID {creator_id} for access.")
+
+
+async def stop_quiz_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle the inline 🛑 Stop Quiz button."""
+    query = update.callback_query
+    if not query or not query.message:
+        return
+
+    await query.answer()
+
+    chat_id = query.message.chat.id
+    chat_type = query.message.chat.type
+    user = query.from_user
+    user_id = user.id if user else None
+    is_anon = False
+
+    session = session_mgr.get(chat_id)
+    if not session:
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        await safe_send_message(ctx, chat_id, "⚠️ No quiz is running.")
+        return
+
+    # In private chats, the player can stop their own quiz.
+    if chat_type == ChatType.PRIVATE:
+        tasks.cancel_all_for_chat(chat_id)
+        try:
+            if session.get("is_private"):
+                await end_private_quiz(chat_id, ctx)
+            else:
+                await end_quiz(update, ctx, session["quiz_id"], True)
+        finally:
+            await session_mgr.delete(chat_id)
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        await safe_send_message(ctx, chat_id, "🛑 Quiz stopped.")
+        return
+
+    # In groups, only an administrator/creator may stop the quiz.
+    if not await _require_admin(ctx, chat_id, user_id, is_anon):
+        await query.answer("Only a group administrator can stop this quiz.", show_alert=True)
+        return
+
+    tasks.cancel_all_for_chat(chat_id)
+    qid = session.get("quiz_id")
+    try:
+        if qid:
+            await end_quiz(update, ctx, qid, True)
+    finally:
+        await session_mgr.delete(chat_id)
+
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+                pass
+    await safe_send_message(ctx, chat_id, "🛑 Quiz stopped by admin.")
 
 
 async def stop_quiz(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1664,8 +1729,16 @@ def register(application: Application) -> None:
     application.add_handler(CommandHandler("pause", pause_quiz))
     application.add_handler(CommandHandler("resume", resume_quiz))
     application.add_handler(CommandHandler("stop", stop_quiz))
+    application.add_handler(CallbackQueryHandler(stop_quiz_button, pattern=r"^quiz_stop$"))
     application.add_handler(CommandHandler("leaderboard", leaderboard_command))
     application.add_handler(CommandHandler("slow", slow_quiz))
     application.add_handler(CommandHandler("fast", fast_quiz))
     application.add_handler(CommandHandler("normal", normal_quiz))
     application.add_handler(PollAnswerHandler(handle_poll_answer))
+    
+
+
+
+
+
+
