@@ -2060,23 +2060,13 @@ def register(app: Client) -> None:
     # This is registered BEFORE the wizard document handler.
     # --------------------------------------------------------
 
-    app.on_message(
-        filters.document
-        & filters.private
-        & filters.regex(
-            r"(?i)\.pdf$",
-            "document.file_name",
-        )
-    )(handle_pdf_direct)
+        # --------------------------------------------------------
+    # DIRECT PDF HANDLER
+    # --------------------------------------------------------
 
-    # MIME fallback for PDFs whose filename does not end in .pdf
     app.on_message(
         filters.document
         & filters.private
-        & filters.regex(
-            r"^application/pdf$",
-            "document.mime_type",
-        )
     )(handle_pdf_direct)
 
     # --------------------------------------------------------
