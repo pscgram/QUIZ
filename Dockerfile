@@ -1,7 +1,6 @@
-
 FROM python:3.11-slim
 
-# System dependencies required for WeasyPrint and PyMuPDF
+# System dependencies for WeasyPrint, PDF processing and OCR
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libpango-1.0-0 \
     libpangocairo-1.0-0 \
@@ -10,6 +9,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libffi-dev \
     shared-mime-info \
     fonts-liberation \
+    tesseract-ocr \
+    tesseract-ocr-eng \
+    tesseract-ocr-mal \
     && rm -rf /var/lib/apt/lists/*
 
 # Application directory
