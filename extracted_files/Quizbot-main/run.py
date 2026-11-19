@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 from __future__ import annotations
 
@@ -42,33 +43,65 @@ async def run_mini_app():
 
 async def health_handler(reader, writer):
     try:
-        request = await asyncio.wait_for(reader.readline(), timeout=5)
-        path = request.decode(errors="ignore").split(" ")[1]
+        try:
+            request = await asyncio.wait_for(
+                reader.readline(),
+                timeout=10,
+            )
+        except asyncio.TimeoutError:
+            logger.debug("Health probe connected without HTTP request")
+            return
 
-        # Read and discard headers
+        if not request:
+            return
+
+        parts = request.decode(
+            "ascii",
+            errors="ignore",
+        ).strip().split()
+
+        if len(parts) < 2:
+            body = b"Bad Request"
+            status = b"400 Bad Request"
+        else:
+            path = parts[1].split("?", 1)[0]
+
+            if path in ("/", "/healthz"):
+                body = b"PSCGram Quiz Bot is running"
+                status = b"200 OK"
+            else:
+                body = b"Not Found"
+                status = b"404 Not Found"
+
+        # Read and discard HTTP headers.
         while True:
-            line = await asyncio.wait_for(reader.readline(), timeout=5)
-            if line in (b"\r\n", b"\n", b""):
+            try:
+                line = await asyncio.wait_for(
+                    reader.readline(),
+                    timeout=5,
+                )
+            except asyncio.TimeoutError:
                 break
 
-        if path in ("/", "/healthz"):
-            body = b"PSCGram Quiz Bot is running"
-            status = b"200 OK"
-        else:
-            body = b"Not Found"
-            status = b"404 Not Found"
+            if line in (b"\r\n", b"\n", b""):
+                break
 
         response = (
             b"HTTP/1.1 " + status + b"\r\n"
             b"Content-Type: text/plain; charset=utf-8\r\n"
             b"Content-Length: " + str(len(body)).encode() + b"\r\n"
-            b"Connection: close\r\n\r\n" + body
+            b"Connection: close\r\n\r\n"
+            + body
         )
+
         writer.write(response)
         await writer.drain()
 
+    except (ConnectionError, asyncio.IncompleteReadError):
+        logger.debug("Health-check client disconnected")
+
     except Exception:
-        logger.warning("Health-check request failed")
+        logger.exception("Unexpected health-check handler error")
 
     finally:
         writer.close()
@@ -109,18 +142,26 @@ async def main(only=None):
     tasks = []
 
     if only in (None, "creator"):
-        tasks.append(asyncio.create_task(run_creator(), name="creator"))
+        tasks.append(
+            asyncio.create_task(run_creator(), name="creator")
+        )
 
     if only in (None, "runner"):
-        tasks.append(asyncio.create_task(run_runner(), name="runner"))
+        tasks.append(
+            asyncio.create_task(run_runner(), name="runner")
+        )
 
     if only == "miniapp":
-        tasks.append(asyncio.create_task(run_mini_app(), name="miniapp"))
+        tasks.append(
+            asyncio.create_task(run_mini_app(), name="miniapp")
+        )
 
     elif only is None and config.MINI_APP_DOMAIN:
-        tasks.append(asyncio.create_task(run_mini_app(), name="miniapp"))
+        tasks.append(
+            asyncio.create_task(run_mini_app(), name="miniapp")
+        )
 
-    # Start HTTP health server for Render Web Service
+    # Start HTTP health server for Render Web Service.
     if only is None:
         tasks.append(
             asyncio.create_task(
@@ -143,6 +184,7 @@ async def main(only=None):
 
     try:
         stop_task = asyncio.create_task(stop_event.wait())
+
         done, pending = await asyncio.wait(
             tasks + [stop_task],
             return_when=asyncio.FIRST_COMPLETED,
@@ -151,6 +193,7 @@ async def main(only=None):
         for task in done:
             if task is not stop_task and not task.cancelled():
                 error = task.exception()
+
                 if error:
                     logger.error(
                         "Task %s crashed: %s",
@@ -177,11 +220,13 @@ async def main(only=None):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
+
     parser.add_argument(
         "--only",
         choices=["creator", "runner", "miniapp"],
         default=None,
     )
+
     args = parser.parse_args()
 
     try:
