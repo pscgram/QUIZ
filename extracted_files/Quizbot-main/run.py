@@ -1,16 +1,10 @@
 #!/usr/bin/env python3
-"""
-Advance Quiz Bot — Open Source Project
-This project was originally developed by Gagan (github.com/devgaganin).
-Reference: https://t.me/advance_quiz_bot
-The codebase has been reviewed and verified with the assistance of Claude AI.
-"""
-
 from __future__ import annotations
 
 import argparse
 import asyncio
 import logging
+import os
 import signal
 import sys
 
@@ -24,92 +18,169 @@ logging.basicConfig(
 )
 logger = logging.getLogger("launcher")
 
-# Silence noisy third-party debug logs by default.
 for noisy in ("httpx", "httpcore", "apscheduler", "pymongo"):
     logging.getLogger(noisy).setLevel(logging.WARNING)
 
 
-async def _run_creator_bot() -> None:
+async def run_creator():
     from quizbot.creator_bot.bot import run_creator_bot
-
-    logger.info("Starting Creator Bot (Pyrogram)...")
+    logger.info("Starting Creator Bot...")
     await run_creator_bot()
 
 
-async def _run_runner_bot() -> None:
+async def run_runner():
     from quizbot.runner_bot.bot import run_runner_bot
-
-    logger.info("Starting Runner Bot (python-telegram-bot)...")
+    logger.info("Starting Player Bot...")
     await run_runner_bot()
 
 
-async def _run_mini_app() -> None:
+async def run_mini_app():
     from quizbot.mini_app.server import run_mini_app_server
-
-    logger.info("Starting Mini App server (FastAPI)...")
+    logger.info("Starting Mini App...")
     await run_mini_app_server()
 
 
-async def main(only: str | None) -> None:
+async def health_handler(reader, writer):
+    try:
+        request = await asyncio.wait_for(reader.readline(), timeout=5)
+        path = request.decode(errors="ignore").split(" ")[1]
+
+        # Read and discard headers
+        while True:
+            line = await asyncio.wait_for(reader.readline(), timeout=5)
+            if line in (b"\r\n", b"\n", b""):
+                break
+
+        if path in ("/", "/healthz"):
+            body = b"PSCGram Quiz Bot is running"
+            status = b"200 OK"
+        else:
+            body = b"Not Found"
+            status = b"404 Not Found"
+
+        response = (
+            b"HTTP/1.1 " + status + b"\r\n"
+            b"Content-Type: text/plain; charset=utf-8\r\n"
+            b"Content-Length: " + str(len(body)).encode() + b"\r\n"
+            b"Connection: close\r\n\r\n" + body
+        )
+        writer.write(response)
+        await writer.drain()
+
+    except Exception:
+        logger.warning("Health-check request failed")
+
+    finally:
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+
+
+async def run_health_server(stop_event):
+    port = int(os.environ.get("PORT", "10000"))
+
+    server = await asyncio.start_server(
+        health_handler,
+        host="0.0.0.0",
+        port=port,
+    )
+
+    logger.info("Health server listening on port %s", port)
+
+    async with server:
+        await stop_event.wait()
+
+
+async def main(only=None):
     problems = config.validate(bot=only or "both")
+
     if problems:
-        for p in problems:
-            logger.error("Config problem: %s", p)
-        logger.error("Fix the above in your .env file (see .env.example) before starting.")
+        for problem in problems:
+            logger.error("Config problem: %s", problem)
         sys.exit(1)
 
-    logger.info("Connecting to MongoDB (db=%s) ...", config.MONGODB_DB_NAME)
+    logger.info("Connecting to MongoDB...")
     await init_db(config.MONGODB_URI, config.MONGODB_DB_NAME)
-    logger.info("Database ready.")
-
-    tasks: list[asyncio.Task] = []
-    if only in (None, "creator"):
-        tasks.append(asyncio.create_task(_run_creator_bot(), name="creator_bot"))
-    if only in (None, "runner"):
-        tasks.append(asyncio.create_task(_run_runner_bot(), name="runner_bot"))
-    if only == "miniapp":
-        tasks.append(asyncio.create_task(_run_mini_app(), name="mini_app"))
-    elif only is None and config.MINI_APP_DOMAIN:
-        tasks.append(asyncio.create_task(_run_mini_app(), name="mini_app"))
+    logger.info("Database connected.")
 
     stop_event = asyncio.Event()
+    tasks = []
 
-    def _handle_signal(*_args):
-        logger.info("Shutdown signal received, stopping bots...")
+    if only in (None, "creator"):
+        tasks.append(asyncio.create_task(run_creator(), name="creator"))
+
+    if only in (None, "runner"):
+        tasks.append(asyncio.create_task(run_runner(), name="runner"))
+
+    if only == "miniapp":
+        tasks.append(asyncio.create_task(run_mini_app(), name="miniapp"))
+
+    elif only is None and config.MINI_APP_DOMAIN:
+        tasks.append(asyncio.create_task(run_mini_app(), name="miniapp"))
+
+    # Start HTTP health server for Render Web Service
+    if only is None:
+        tasks.append(
+            asyncio.create_task(
+                run_health_server(stop_event),
+                name="health_server",
+            )
+        )
+
+    def handle_signal(*_):
+        logger.info("Shutdown signal received")
         stop_event.set()
 
     loop = asyncio.get_running_loop()
+
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
-            loop.add_signal_handler(sig, _handle_signal)
+            loop.add_signal_handler(sig, handle_signal)
         except NotImplementedError:
-            pass  # Windows
+            pass
 
     try:
+        stop_task = asyncio.create_task(stop_event.wait())
         done, pending = await asyncio.wait(
-            [*tasks, asyncio.ensure_future(stop_event.wait())],
+            tasks + [stop_task],
             return_when=asyncio.FIRST_COMPLETED,
         )
-        for t in done:
-            if t.exception():
-                logger.exception("A bot task crashed:", exc_info=t.exception())
+
+        for task in done:
+            if task is not stop_task and not task.cancelled():
+                error = task.exception()
+                if error:
+                    logger.error(
+                        "Task %s crashed: %s",
+                        task.get_name(),
+                        error,
+                    )
+
     finally:
         logger.info("Shutting down...")
-        for t in tasks:
-            if not t.done():
-                t.cancel()
+
+        stop_event.set()
+
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+
         await asyncio.gather(*tasks, return_exceptions=True)
+
         await close_session()
         await close_db()
+
         logger.info("Shutdown complete.")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Run the Advance Quiz Bot platform.")
+    parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--only", choices=["creator", "runner", "miniapp"], default=None,
-        help="Run only one component (default: run both bots, plus the "
-             "Mini App server too if MINI_APP_DOMAIN is configured).",
+        "--only",
+        choices=["creator", "runner", "miniapp"],
+        default=None,
     )
     args = parser.parse_args()
 
