@@ -1,4 +1,4 @@
-name: Extract ZIP in Repository
+name: Extract ZIP Files
 
 on:
   workflow_dispatch:
@@ -14,18 +14,40 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Extract ZIP files
+      - name: Find and extract ZIP
+        shell: bash
         run: |
-          find . -type f -name "*.zip" ! -path "./.git/*" | while read file; do
-            folder="${file%.zip}"
-            mkdir -p "$folder"
-            unzip -o "$file" -d "$folder"
-          done
+          set -e
+
+          ZIP_FILE=$(find . -type f -name "*.zip" -not -path "./.git/*" | head -n 1)
+
+          if [ -z "$ZIP_FILE" ]; then
+            echo "ERROR: No ZIP file found in repository."
+            echo "Upload your ZIP file to the repository first."
+            exit 1
+          fi
+
+          echo "Found ZIP: $ZIP_FILE"
+
+          DEST="extracted_files"
+          mkdir -p "$DEST"
+
+          unzip -o "$ZIP_FILE" -d "$DEST"
+
+          echo "Extraction complete."
+          find "$DEST" -type f
 
       - name: Commit extracted files
+        shell: bash
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add .
-          git commit -m "Extract ZIP files in repository" || echo "No changes to commit"
-          git push
+
+          git add extracted_files
+
+          if git diff --cached --quiet; then
+            echo "No extracted changes to commit."
+          else
+            git commit -m "Extract ZIP contents"
+            git push
+          fi
