@@ -1,4 +1,3 @@
-
 """
 Advance Quiz Bot — Open Source Project
 This project was originally developed by Gagan (github.com/devgaganin).
@@ -50,11 +49,15 @@ API_HASH: str | None = _env("API_HASH")
 CREATOR_BOT_TOKEN: str | None = _env("CREATOR_BOT_TOKEN")
 RUNNER_BOT_TOKEN: str | None = _env("RUNNER_BOT_TOKEN")
 
+# Player Bot username used for quiz sharing and deep links.
+# Do not include @ in the environment variable.
+RUNNER_BOT_USERNAME: str = _env("RUNNER_BOT_USERNAME", "Quizpscbot") or "Quizpscbot"
+
 # ---------------------------------------------------------------------------
 # Database (MongoDB Atlas)
 # ---------------------------------------------------------------------------
 MONGODB_URI: str | None = _env("MONGODB_URI")
-MONGODB_DB_NAME: str = _env("MONGODB_DB_NAME", "quizbot")
+MONGODB_DB_NAME: str = _env("MONGODB_DB_NAME", "quizbot") or "quizbot"
 
 # ---------------------------------------------------------------------------
 # Ownership / admin access
@@ -82,9 +85,21 @@ RAZORPAY_KEY_ID: str | None = _env("RAZORPAY_KEY_ID")
 RAZORPAY_KEY_SECRET: str | None = _env("RAZORPAY_KEY_SECRET")
 
 PLANS: dict[str, dict] = {
-    "1_month": {"days": 30, "amount": _env_int("PLAN_1_MONTH_AMOUNT", 9900), "label": "1 Month"},
-    "3_month": {"days": 90, "amount": _env_int("PLAN_3_MONTH_AMOUNT", 24900), "label": "3 Months"},
-    "1_year": {"days": 365, "amount": _env_int("PLAN_1_YEAR_AMOUNT", 79900), "label": "1 Year"},
+    "1_month": {
+        "days": 30,
+        "amount": _env_int("PLAN_1_MONTH_AMOUNT", 9900),
+        "label": "1 Month",
+    },
+    "3_month": {
+        "days": 90,
+        "amount": _env_int("PLAN_3_MONTH_AMOUNT", 24900),
+        "label": "3 Months",
+    },
+    "1_year": {
+        "days": 365,
+        "amount": _env_int("PLAN_1_YEAR_AMOUNT", 79900),
+        "label": "1 Year",
+    },
 }
 
 # ---------------------------------------------------------------------------
@@ -96,60 +111,66 @@ PDF_API_BASE: str | None = _env("PDF_API_BASE")
 # Quiz Player Mini App (Telegram WebApp)
 # ---------------------------------------------------------------------------
 MINI_APP_DOMAIN: str | None = _env("MINI_APP_DOMAIN")
-MINI_APP_HOST: str = _env("MINI_APP_HOST", "0.0.0.0")
-MINI_APP_PORT: int = _env_int("PORT") or _env_int("MINI_APP_PORT", 8080)
+MINI_APP_HOST: str = _env("MINI_APP_HOST", "0.0.0.0") or "0.0.0.0"
+MINI_APP_PORT: int = _env_int("PORT") or _env_int("MINI_APP_PORT", 8080) or 8080
 MINI_APP_REQUIRE_PREMIUM: bool = _env_bool("MINI_APP_REQUIRE_PREMIUM", False)
 
 # ---------------------------------------------------------------------------
 # AI providers
 # ---------------------------------------------------------------------------
 OPENROUTER_DEFAULT_KEYS: list[str] = [
-    k for k in _env("OPENROUTER_DEFAULT_KEYS", "").split(",") if k
+    k.strip()
+    for k in (_env("OPENROUTER_DEFAULT_KEYS", "") or "").split(",")
+    if k.strip()
 ]
 
 GEMINI_URL: str = _env(
     "GEMINI_URL",
     "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent",
-)
+) or "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent"
 
 GROQ_URL: str = _env(
     "GROQ_URL",
     "https://api.groq.com/openai/v1/chat/completions",
-)
+) or "https://api.groq.com/openai/v1/chat/completions"
 
 POLLINATIONS_URL: str = _env(
     "POLLINATIONS_URL",
     "https://text.pollinations.ai/openai",
-)
+) or "https://text.pollinations.ai/openai"
 
 # ---------------------------------------------------------------------------
 # Rate limiting / quiz tuning
 # ---------------------------------------------------------------------------
-RATE_LIMIT_WINDOW: int = _env_int("RATE_LIMIT_WINDOW", 60)
-RATE_LIMIT_MAX_REQUESTS: int = _env_int("RATE_LIMIT_MAX_REQUESTS", 20)
-SESSION_TIMEOUT: int = _env_int("SESSION_TIMEOUT", 3600)
-SESSION_CLEANUP_INTERVAL: int = _env_int("SESSION_CLEANUP_INTERVAL", 600)
-CHEAT_SPEED_THRESHOLD: float = float(_env("CHEAT_SPEED_THRESHOLD", "3.0"))
-WATCHDOG_INTERVAL: int = _env_int("WATCHDOG_INTERVAL", 300)
+RATE_LIMIT_WINDOW: int = _env_int("RATE_LIMIT_WINDOW", 60) or 60
+RATE_LIMIT_MAX_REQUESTS: int = _env_int("RATE_LIMIT_MAX_REQUESTS", 20) or 20
+SESSION_TIMEOUT: int = _env_int("SESSION_TIMEOUT", 3600) or 3600
+SESSION_CLEANUP_INTERVAL: int = _env_int("SESSION_CLEANUP_INTERVAL", 600) or 600
+CHEAT_SPEED_THRESHOLD: float = float(_env("CHEAT_SPEED_THRESHOLD", "3.0") or "3.0")
+WATCHDOG_INTERVAL: int = _env_int("WATCHDOG_INTERVAL", 300) or 300
 
+# ---------------------------------------------------------------------------
 # Creator Bot rate limits
+# ---------------------------------------------------------------------------
 CREATOR_RATE_LIMIT_DEFAULT: tuple[int, int] = (
-    _env_int("CREATOR_RATE_LIMIT_DEFAULT_HITS", 10),
-    _env_int("CREATOR_RATE_LIMIT_DEFAULT_WINDOW", 1800),
-)
-CREATOR_RATE_LIMIT_CREATE: tuple[int, int] = (
-    _env_int("CREATOR_RATE_LIMIT_CREATE_HITS", 4),
-    _env_int("CREATOR_RATE_LIMIT_CREATE_WINDOW", 1800),
-)
-CREATOR_RATE_LIMIT_STRICT: tuple[int, int] = (
-    _env_int("CREATOR_RATE_LIMIT_STRICT_HITS", 1),
-    _env_int("CREATOR_RATE_LIMIT_STRICT_WINDOW", 3600),
+    _env_int("CREATOR_RATE_LIMIT_DEFAULT_HITS", 10) or 10,
+    _env_int("CREATOR_RATE_LIMIT_DEFAULT_WINDOW", 1800) or 1800,
 )
 
-PAGE_SIZE: int = _env_int("PAGE_SIZE", 10)
-QUESTIONS_PER_PAGE: int = _env_int("QUESTIONS_PER_PAGE", 10)
-LEADERS_PAGE_SIZE: int = _env_int("LEADERS_PAGE_SIZE", 20)
-CACHE_EXPIRY: int = _env_int("CACHE_EXPIRY", 600)
+CREATOR_RATE_LIMIT_CREATE: tuple[int, int] = (
+    _env_int("CREATOR_RATE_LIMIT_CREATE_HITS", 4) or 4,
+    _env_int("CREATOR_RATE_LIMIT_CREATE_WINDOW", 1800) or 1800,
+)
+
+CREATOR_RATE_LIMIT_STRICT: tuple[int, int] = (
+    _env_int("CREATOR_RATE_LIMIT_STRICT_HITS", 1) or 1,
+    _env_int("CREATOR_RATE_LIMIT_STRICT_WINDOW", 3600) or 3600,
+)
+
+PAGE_SIZE: int = _env_int("PAGE_SIZE", 10) or 10
+QUESTIONS_PER_PAGE: int = _env_int("QUESTIONS_PER_PAGE", 10) or 10
+LEADERS_PAGE_SIZE: int = _env_int("LEADERS_PAGE_SIZE", 20) or 20
+CACHE_EXPIRY: int = _env_int("CACHE_EXPIRY", 600) or 600
 
 SUPPORTED_AI_PROVIDERS: list[str] = [
     "gemini",
@@ -171,12 +192,15 @@ for _d in (DATA_DIR, CACHE_DIR, TEMP_DIR):
     _d.mkdir(parents=True, exist_ok=True)
 
 
+# ---------------------------------------------------------------------------
+# Configuration validation
+# ---------------------------------------------------------------------------
 def validate(bot: str = "both") -> list[str]:
     """Return a list of human-readable problems with the current config.
 
     `bot` may be 'creator', 'runner', 'miniapp', or 'both'.
     """
-    problems = []
+    problems: list[str] = []
 
     if not MONGODB_URI:
         problems.append(
@@ -193,7 +217,10 @@ def validate(bot: str = "both") -> list[str]:
         return problems
 
     if not API_ID or not API_HASH:
-        problems.append("API_ID / API_HASH are required (get them from my.telegram.org)")
+        problems.append(
+            "API_ID / API_HASH are required "
+            "(get them from https://my.telegram.org)"
+        )
 
     if bot in ("creator", "both") and not CREATOR_BOT_TOKEN:
         problems.append("CREATOR_BOT_TOKEN is not set")
@@ -202,6 +229,8 @@ def validate(bot: str = "both") -> list[str]:
         problems.append("RUNNER_BOT_TOKEN is not set")
 
     if not OWNER_ID:
-        problems.append("OWNER_ID is not set (owner-only commands will be unreachable)")
+        problems.append(
+            "OWNER_ID is not set (owner-only commands will be unreachable)"
+        )
 
     return problems
