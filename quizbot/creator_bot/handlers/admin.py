@@ -1,3 +1,4 @@
+
 """
 Advance Quiz Bot — Open Source Project
 This project was originally developed by Gagan (github.com/devgaganin).
@@ -159,13 +160,13 @@ async def start_cmd(c: Client, m: Message) -> None:
 @ratelimit("default")
 async def help_cmd(c: Client, m: Message) -> None:
     """/help -- full command reference."""
-    await m.reply(HELP_TEXT, disable_web_page_preview=True)
+    await m.reply(HELP_TEXT)
 
 
 @ratelimit("default")
 async def features_cmd(c: Client, m: Message) -> None:
     """/features -- short marketing-style feature overview."""
-    await m.reply(FEATURES_TEXT, disable_web_page_preview=True)
+    await m.reply(FEATURES_TEXT)
 
 
 async def limit_cmd(c: Client, m: Message) -> None:
@@ -205,16 +206,32 @@ async def gcast_cmd(c: Client, m: Message) -> None:
             if bm.text:
                 await c.send_message(cid, bm.text, reply_markup=bm.reply_markup)
             elif bm.photo:
-                await c.send_photo(cid, bm.photo.file_id, caption=bm.caption or "", reply_markup=bm.reply_markup)
+                await c.send_photo(
+                    cid,
+                    bm.photo.file_id,
+                    caption=bm.caption or "",
+                    reply_markup=bm.reply_markup,
+                )
             elif bm.video:
-                await c.send_video(cid, bm.video.file_id, caption=bm.caption or "", reply_markup=bm.reply_markup)
+                await c.send_video(
+                    cid,
+                    bm.video.file_id,
+                    caption=bm.caption or "",
+                    reply_markup=bm.reply_markup,
+                )
             elif bm.document:
-                await c.send_document(cid, bm.document.file_id, caption=bm.caption or "", reply_markup=bm.reply_markup)
+                await c.send_document(
+                    cid,
+                    bm.document.file_id,
+                    caption=bm.caption or "",
+                    reply_markup=bm.reply_markup,
+                )
             else:
                 await bm.copy(cid)
             sent += 1
         except Exception:
             failed += 1
+
         if (i + 1) % 100 == 0:
             await progress.edit_text(f"Progress: {sent}/{total}")
             await asyncio.sleep(10)
@@ -283,17 +300,20 @@ def _leaders_rich_md(quiz_name: str, rows: list[dict], start_rank: int) -> str:
     message vs. the normal 4096 limit -- lets a full 200-row leaderboard
     page go out as one nicely formatted message instead of many)."""
     lines = [
-        f"### \U0001F3C5 Leading Aspirants -- {quiz_name}",
+        f"### 🏅 Leading Aspirants -- {quiz_name}",
         "",
         "| # | Name | Score | Qs | Time |",
         "|--:|:-----|------:|---:|-----:|",
     ]
     for j, r in enumerate(rows, start=start_rank):
-        icon = "\U0001F947" if j == 1 else "\U0001F948" if j == 2 else "\U0001F949" if j == 3 else str(j)
+        icon = "🥇" if j == 1 else "🥈" if j == 2 else "🥉" if j == 3 else str(j)
         name = str(r.get("user_name") or "Player")[:22].replace("|", "\\|")
         secs = r.get("time_taken", 0) or 0
         mn, sc = divmod(int(secs), 60)
-        lines.append(f"| {icon} | {name} | {r.get('score', 0)} | {r.get('total_questions', 0)} | {mn}m {sc}s |")
+        lines.append(
+            f"| {icon} | {name} | {r.get('score', 0)} | "
+            f"{r.get('total_questions', 0)} | {mn}m {sc}s |"
+        )
     return "\n".join(lines)
 
 
@@ -332,9 +352,12 @@ async def leaders_cmd(c: Client, m: Message) -> None:
         await m.reply("No one has attempted this quiz yet.")
         return
 
-    status = await m.reply(f"Found {len(rows)}+ aspirant(s). Sending leaderboard...")
+    status = await m.reply(
+        f"Found {len(rows)}+ aspirant(s). Sending leaderboard..."
+    )
     offset, rank = 0, 1
     page_rows = rows
+
     while page_rows:
         rich_md = _leaders_rich_md(quiz["quiz_name"], page_rows, rank)
         await send_rich_or_fallback(
@@ -346,7 +369,9 @@ async def leaders_cmd(c: Client, m: Message) -> None:
         )
         rank += len(page_rows)
         offset += LEADERS_PAGE_SIZE
-        page_rows = await board.page(qid, offset=offset, limit=LEADERS_PAGE_SIZE)
+        page_rows = await board.page(
+            qid, offset=offset, limit=LEADERS_PAGE_SIZE
+        )
         if page_rows:
             await asyncio.sleep(1)
 
