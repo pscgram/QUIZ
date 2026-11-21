@@ -1,3 +1,4 @@
+
 """
 Advance Quiz Bot — Open Source Project
 This project was originally developed by Gagan (github.com/devgaganin).
@@ -679,9 +680,9 @@ async def gemini_page_questions(
     """
     Extract EXISTING MCQs from a PDF page.
 
-    Do not create new questions.
-    Do not translate or paraphrase.
-    Preserve original wording and Malayalam/Unicode characters.
+    Language is detected from the PDF itself.
+    Do not create, translate, or rewrite questions.
+    Preserve original wording and Unicode characters.
     """
 
     prompt = f"""
@@ -689,9 +690,14 @@ TASK: Extract the EXISTING multiple-choice questions printed on this PDF page.
 
 PDF page number: {page_num}
 Requested maximum questions: {questions_hint}
-Language: {AIQUIZ_LANG.get(lang, "Original language")}
-Difficulty setting: {AIQUIZ_DIFFICULTY.get(diff, "Moderate")}
-Exam style setting: {AIQUIZ_EXAM.get(exam, "Common One Day Exam")}
+
+LANGUAGE INSTRUCTION:
+- AUTO-DETECT THE LANGUAGE DIRECTLY FROM THE PDF PAGE.
+- KEEP THE EXACT ORIGINAL LANGUAGE AND SCRIPT.
+- NEVER TRANSLATE TO ENGLISH OR ANY OTHER LANGUAGE.
+- If the page contains Malayalam, output Malayalam exactly as printed.
+- If the page contains English, output English exactly as printed.
+- If the page contains multiple languages, preserve the original languages.
 
 STRICT EXTRACTION RULES:
 
@@ -753,9 +759,10 @@ Start with [ and end with ].
             "parts": [{
                 "text": (
                     "You are a faithful document extraction system, not a quiz writer. "
-                    "Copy existing text from the supplied PDF page. "
-                    "Never rewrite, translate, normalize, correct, or invent text. "
-                    "Return only valid JSON."
+                    "Copy existing text from the supplied PDF page in its original language "
+                    "and original script. Detect the language from the document itself. "
+                    "Never translate into English. Never rewrite, normalize, correct, "
+                    "or invent text. Return only valid JSON."
                 )
             }]
         },
