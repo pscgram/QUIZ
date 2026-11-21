@@ -1,3 +1,4 @@
+
 """
 Advance Quiz Bot — Open Source Project
 This project was originally developed by Gagan (github.com/devgaganin).
@@ -11,7 +12,7 @@ import asyncio
 import logging
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from telegram import Update
+from telegram import BotCommand, Update
 from telegram.ext import Application
 
 from quizbot.shared import config
@@ -62,14 +63,35 @@ def build_application() -> Application:
 async def run_runner_bot() -> None:
     """Run the Runner Bot non-blocking, as one of two concurrent asyncio
     tasks sharing a single event loop with the Creator Bot.
-
-    Uses the manual PTB lifecycle (initialize/start/start_polling) instead
-    of `run_polling()`, which owns its own event loop and would block the
-    other bot from running alongside it in the same process.
     """
     application = build_application()
 
     await application.initialize()
+
+    # Register Telegram Menu commands.
+    try:
+        await application.bot.set_my_commands([
+            BotCommand("start", "Start and play a quiz"),
+            BotCommand("help", "Help and instructions"),
+            BotCommand("aiquiz", "Create an AI quiz"),
+            BotCommand("pdfquiz", "Create quiz from PDF"),
+            BotCommand("pollquiz", "Create a poll quiz"),
+            BotCommand("mix", "Create a mixed quiz"),
+            BotCommand("html", "Get HTML report"),
+            BotCommand("pdf", "Get PDF report"),
+            BotCommand("schedule", "Schedule a quiz"),
+            BotCommand("viewschedule", "View scheduled quizzes"),
+            BotCommand("cancelschedule", "Cancel scheduled quiz"),
+            BotCommand("trans", "Translate quiz"),
+            BotCommand("pause", "Pause a quiz"),
+            BotCommand("resume", "Resume a quiz"),
+            BotCommand("stop", "Stop a quiz"),
+            BotCommand("leaderboard", "View leaderboard"),
+        ])
+        logger.info("Runner Bot menu commands registered.")
+    except Exception:
+        logger.exception("Failed to register Runner Bot menu commands.")
+
     await application.start()
     await application.updater.start_polling(
         allowed_updates=Update.ALL_TYPES,
@@ -78,8 +100,7 @@ async def run_runner_bot() -> None:
     logger.info("Runner Bot polling started.")
 
     try:
-        # Block here until this task is cancelled by the launcher (run.py),
-        # which happens on SIGINT/SIGTERM or if the sibling bot task dies.
+        # Block here until this task is cancelled by the launcher.
         await asyncio.Future()
     finally:
         logger.info("Runner Bot shutting down...")
