@@ -1239,11 +1239,10 @@ async def start_quiz(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             )
             return
 
-        user_id = update.message.from_user.id
+                user_id = update.message.from_user.id
 
-        if not await is_premium_user(user_id):
-            await safe_send_message(ctx, chat_id, "Please help us to make this project more valuable by purchasing premium! Thanks")
-            return
+        # Allow users to open shared quiz links without premium.
+
         if not await rate_limiter.check(user_id):
             await safe_send_message(ctx, chat_id, "⏱️ Too many requests. Wait a moment.")
             return
