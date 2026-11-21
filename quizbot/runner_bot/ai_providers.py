@@ -9,6 +9,7 @@ PDF extraction updated to prioritize verbatim source text.
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import re
@@ -344,8 +345,6 @@ def _extract_json_array(raw: str) -> Optional[str]:
     if start < 0:
         return None
 
-    # Walk the text and find the matching closing bracket while respecting
-    # quoted strings and escaped characters.
     depth = 0
     in_string = False
     escaped = False
@@ -378,11 +377,7 @@ def parse_ai_questions(raw: str) -> list[dict]:
     """
     Parse AI JSON into quiz question dictionaries.
 
-    Important:
-    - Do not truncate extracted question text or options.
-    - Do not alter Malayalam/Unicode characters.
-    - Do not normalize Unicode.
-    - Keep the source strings intact, including internal spacing.
+    Do not normalize Unicode or rewrite extracted text.
     """
 
     questions: list[dict] = []
@@ -408,7 +403,6 @@ def parse_ai_questions(raw: str) -> list[dict]:
                     if not isinstance(options_raw, list):
                         continue
 
-                    # Preserve option text; do not strip or truncate.
                     options = []
                     original_to_new = {}
 
@@ -472,7 +466,7 @@ def parse_ai_questions(raw: str) -> list[dict]:
         except (json.JSONDecodeError, ValueError, TypeError) as exc:
             logger.warning("AI JSON parsing failed: %s", exc)
 
-    # Legacy fallback parser (used by other quiz-generation flows).
+    # Legacy fallback parser.
     blocks = re.split(r"\n{2,}", raw.strip())
 
     for block in blocks:
@@ -529,7 +523,7 @@ def parse_ai_questions(raw: str) -> list[dict]:
 
 
 # ---------------------------------------------------------------------
-# Topic-based quiz generation (existing functionality)
+# Topic-based quiz generation
 # ---------------------------------------------------------------------
 
 async def generate_in_chunks(
@@ -582,9 +576,7 @@ async def generate_in_chunks(
             prompt = QUESTION_FORMAT_BILINGUAL.format(
                 count=chunk,
                 topic=topic,
-                diff=AIQUIZ_DIFFICULTY.get(
-                    diff, "Moderate"
-                ),
+                diff=AIQUIZ_DIFFICULTY.get(diff, "Moderate"),
                 exam=AIQUIZ_EXAM.get(
                     exam, "Common One Day Exam"
                 ),
@@ -598,9 +590,7 @@ async def generate_in_chunks(
                 count=chunk,
                 topic=topic,
                 lang=lang1_name,
-                diff=AIQUIZ_DIFFICULTY.get(
-                    diff, "Moderate"
-                ),
+                diff=AIQUIZ_DIFFICULTY.get(diff, "Moderate"),
                 exam=AIQUIZ_EXAM.get(
                     exam, "Common One Day Exam"
                 ),
@@ -665,8 +655,62 @@ async def generate_in_chunks(
 
 
 # ---------------------------------------------------------------------
-# PDF page question extraction
+# PDF page question extraction — VERBATIM TEXT PRIORITY
 # ---------------------------------------------------------------------
+
+def _extract_pdf_page_text(page_pdf_b64: str) -> str:
+    """
+    Extract embedded text from a single-page PDF.
+
+    No Unicode normalization or spelling correction is performed.
+    """
+
+    try:
+        import fitz
+
+        pdf_bytes = base64.b64decode(page_pdf_b64)
+
+        with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
+            if not doc.page_count:
+                return ""
+
+            return doc[0].get_text("text", sort=True)
+
+    except Exception as exc:
+        logger.warning(
+            "PDF text-layer extraction failed: %s", exc
+        )
+        return ""
+
+
+def _pdf_text_layer_is_usable(text: str) -> bool:
+    """
+    Basic quality check for embedded PDF text.
+
+    This cannot prove that a font's Unicode mapping is correct.
+    The original page must still be checked visually.
+    """
+
+    if not text or len(text.strip()) < 30:
+        return False
+
+    visible = [ch for ch in text if not ch.isspace()]
+
+    if len(visible) < 20:
+        return False
+
+    bad_chars = sum(
+        1 for ch in visible
+        if ch == "\ufffd"
+        or 0xE000 <= ord(ch) <= 0xF8FF
+        or ord(ch) < 32
+    )
+
+    if bad_chars / len(visible) > 0.02:
+        return False
+
+    return True
+
 
 async def gemini_page_questions(
     api_key: str,
@@ -678,91 +722,161 @@ async def gemini_page_questions(
     lang: str,
 ) -> list[dict]:
     """
-    Extract EXISTING MCQs from a PDF page.
+    Extract existing MCQs from a PDF page.
 
-    Language is detected from the PDF itself.
-    Do not create, translate, or rewrite questions.
-    Preserve original wording and Unicode characters.
+    Strategy:
+    1. Extract embedded PDF text without modifying it.
+    2. Send the original PDF page to Gemini.
+    3. Ask Gemini to compare the text layer against the page.
+    4. Preserve original wording and Unicode characters.
+    5. Never guess unreadable text.
     """
 
+    extracted_text = _extract_pdf_page_text(page_pdf_b64)
+
+    text_layer_available = _pdf_text_layer_is_usable(
+        extracted_text
+    )
+
+    if text_layer_available:
+        source_text = extracted_text
+    else:
+        source_text = (
+            "No reliable embedded text layer was extracted. "
+            "Read the original PDF page carefully."
+        )
+
     prompt = f"""
-TASK: Extract the EXISTING multiple-choice questions printed on this PDF page.
+You are a DOCUMENT TRANSCRIPTION AND MCQ EXTRACTION SYSTEM.
 
-PDF page number: {page_num}
-Requested maximum questions: {questions_hint}
+Extract EXISTING multiple-choice questions from the supplied
+original PDF page.
 
-LANGUAGE INSTRUCTION:
-- AUTO-DETECT THE LANGUAGE DIRECTLY FROM THE PDF PAGE.
-- KEEP THE EXACT ORIGINAL LANGUAGE AND SCRIPT.
-- NEVER TRANSLATE TO ENGLISH OR ANY OTHER LANGUAGE.
-- If the page contains Malayalam, output Malayalam exactly as printed.
-- If the page contains English, output English exactly as printed.
-- If the page contains multiple languages, preserve the original languages.
+PDF PAGE: {page_num}
+MAXIMUM QUESTIONS: {questions_hint}
 
-STRICT EXTRACTION RULES:
+IMPORTANT SOURCE TEXT:
 
-1. Extract questions that are ALREADY PRINTED on this page.
-2. NEVER invent, generate, add, or compose a new question.
-3. NEVER paraphrase, simplify, translate, correct, or rewrite the text.
-4. Preserve Malayalam text exactly as visible.
-5. Preserve the original spelling, punctuation, symbols, numbers, and characters.
-6. Preserve the original question wording and option wording.
-7. Do not convert Malayalam to English or English to Malayalam.
-8. Do not replace Malayalam characters with similar-looking characters.
-9. Do not silently fix spelling or grammar.
-10. Do not add your own answer options.
-11. If the question continues from another page, extract only what is visible.
-12. If a question or option is unclear or cut off, do not guess missing text.
-13. If you cannot confidently identify the correct answer from the PDF, set "c": [].
-14. Extract up to {questions_hint} questions. If fewer are printed, return fewer.
-15. Include the original question number inside the question text if it is printed.
-16. Return only the questions present on this page.
-17. Return a JSON array only, with no prose and no markdown.
+The following text was extracted directly from the PDF's embedded
+text layer. It may be accurate, or it may contain font-encoding
+errors. Compare it carefully with the original PDF page.
 
-JSON format:
+----- BEGIN PDF TEXT LAYER -----
+
+{source_text}
+
+----- END PDF TEXT LAYER -----
+
+
+STRICT LANGUAGE AND CHARACTER RULES:
+
+1. Detect the original language and script from the PDF page.
+2. Preserve the original language.
+3. Never translate.
+4. Never paraphrase.
+5. Never simplify.
+6. Never correct spelling or grammar.
+7. Never normalize or transliterate Unicode characters.
+8. Never replace Malayalam characters with similar-looking characters.
+9. Preserve original punctuation, numbers and symbols.
+10. Preserve the original question and option wording.
+
+MALAYALAM PRESERVATION:
+
+If the page contains Malayalam:
+
+- Preserve every Malayalam character as printed.
+- Do not convert Malayalam into English.
+- Do not convert Malayalam into Manglish.
+- Do not replace Malayalam words with synonyms.
+- Do not silently correct spelling.
+- Do not remove or alter vowel signs, chillus, conjuncts or punctuation.
+- Compare the embedded text with the original page before using it.
+- If the embedded text contains corrupted characters, do not copy
+  those corrupted characters as if they were correct.
+- If the original character cannot be identified confidently,
+  do not guess it.
+
+EXTRACTION RULES:
+
+1. Extract only questions actually printed on this page.
+2. Do not generate new questions.
+3. Do not add questions from general knowledge.
+4. Do not invent missing options.
+5. Preserve the original option order.
+6. Include the printed question number when available.
+7. Extract only the visible part of a question that continues
+   onto another page.
+8. Do not invent explanations.
+9. Use null for explanation unless it is printed on the page.
+10. Extract no more than {questions_hint} questions.
+11. If fewer questions are printed, return fewer.
+12. Do not duplicate a question.
+13. Do not guess unreadable words or characters.
+
+TEXT-LAYER VERIFICATION:
+
+- Compare the extracted PDF text with the original PDF page.
+- If the text layer agrees with the page, use its exact wording.
+- If the text layer disagrees with the page, trust only text that
+  can be read confidently from the original page.
+- Never assume that a text layer is correct merely because it
+  contains readable characters.
+- If a word or character is unclear in both sources, do not guess.
+
+ANSWER RULES:
+
+- Use zero-based option indexes.
+- Include the correct answer only when clearly established
+  by the printed answer key or an unambiguous indication on the page.
+- If the answer is not printed or cannot be identified confidently,
+  return an empty array for "c".
+- Never invent an answer.
+- Never add an explanation that is not printed.
+
+OUTPUT FORMAT:
+
+Return a valid JSON array only.
+
 [
   {{
-    "q": "Question exactly as printed",
-    "o": ["Option exactly as printed", "Option exactly as printed"],
+    "q": "Original question exactly as printed",
+    "o": [
+      "Original option A",
+      "Original option B",
+      "Original option C",
+      "Original option D"
+    ],
     "c": [0],
     "e": null
   }}
 ]
 
-For "q":
-- Copy the question text faithfully.
-- Do not truncate the question.
-- Keep Malayalam and other Unicode characters as they appear.
+The "q" field must contain the original question.
+The "o" field must contain the original options.
+The "c" field must contain zero-based correct option indexes.
+The "e" field must contain the printed explanation or null.
 
-For "o":
-- Copy each printed option faithfully.
-- Do not truncate options.
-- Do not create missing options.
-- Preserve option ordering.
+No markdown.
+No code fences.
+No additional commentary.
 
-For "c":
-- Use zero-based option indexes.
-- Use an empty array if the answer is not clearly available.
-- Never guess the correct answer.
+Return [] if no questions can be extracted confidently.
 
-For "e":
-- Do not invent explanations.
-- Use null unless an explanation is printed on the page.
-- If an explanation is printed, copy it exactly.
-
-OUTPUT: JSON array only.
-Start with [ and end with ].
+OUTPUT: JSON ARRAY ONLY.
 """
 
     payload = {
         "system_instruction": {
             "parts": [{
                 "text": (
-                    "You are a faithful document extraction system, not a quiz writer. "
-                    "Copy existing text from the supplied PDF page in its original language "
-                    "and original script. Detect the language from the document itself. "
-                    "Never translate into English. Never rewrite, normalize, correct, "
-                    "or invent text. Return only valid JSON."
+                    "You are a faithful PDF transcription and extraction "
+                    "system, not a quiz writer. Preserve original text "
+                    "and scripts. The original PDF page is the visual "
+                    "source of truth. Use embedded text only after "
+                    "checking it against the page. Never translate, "
+                    "rewrite, normalize, correct or invent text. "
+                    "Never guess unclear characters. Return valid JSON only."
                 )
             }]
         },
@@ -779,7 +893,7 @@ Start with [ and end with ].
             ],
         }],
         "generationConfig": {
-            "maxOutputTokens": max(1024, questions_hint * 500),
+            "maxOutputTokens": max(2048, questions_hint * 500),
             "temperature": 0,
         },
     }
@@ -799,14 +913,21 @@ Start with [ and end with ].
             f"Gemini {status}: {str(data)[:300]}"
         )
 
-    raw = data["candidates"][0]["content"]["parts"][0]["text"]
+    try:
+        raw = data["candidates"][0]["content"]["parts"][0]["text"]
+    except (KeyError, IndexError, TypeError) as exc:
+        raise RuntimeError(
+            f"Invalid Gemini response: {str(data)[:300]}"
+        ) from exc
+
     raw = raw.strip()
 
     questions = parse_ai_questions(raw)
 
     logger.info(
-        "PDF extraction page %s: extracted %d questions",
+        "PDF extraction page %s: text_layer=%s, extracted=%d",
         page_num,
+        text_layer_available,
         len(questions),
     )
 
