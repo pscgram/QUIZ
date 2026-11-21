@@ -1,3 +1,4 @@
+
 """
 Advance Quiz Bot — Open Source Project
 This project was originally developed by Gagan (github.com/devgaganin).
@@ -256,14 +257,218 @@ async def _count_pdf_pages(pdf_path: str) -> int:
 
 
 # ============================================================
-# MESSAGE HANDLER — PAGE RANGE & QUIZ NAME
+# REVIEW KEYBOARD
+# ============================================================
+
+def _review_kb(
+    uid: int,
+    index: int,
+    total: int,
+    skipped: set,
+) -> InlineKeyboardMarkup:
+
+    skip_label = (
+        "↩️ Keep this question"
+        if index in skipped
+        else "⏭ Skip this question"
+    )
+
+    buttons = [
+        [
+            InlineKeyboardButton(
+                "✏️ Edit Question / Options",
+                callback_data=f"pdfq_ed_{uid}_menu",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "⏮ Previous",
+                callback_data=f"pdfq_rv_{uid}_prev",
+            ),
+            InlineKeyboardButton(
+                "Next ⏭",
+                callback_data=f"pdfq_rv_{uid}_next",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                skip_label,
+                callback_data=f"pdfq_rv_{uid}_toggle",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "✅ Approve & Create Quiz",
+                callback_data=f"pdfq_rv_{uid}_finish",
+            )
+        ],
+    ]
+
+    return InlineKeyboardMarkup(buttons)
+
+
+# ============================================================
+# EDIT MENU KEYBOARD
+# ============================================================
+
+def _edit_menu_kb(uid: int, question: dict) -> InlineKeyboardMarkup:
+    options = question.get("options", [])
+
+    buttons = [
+        [
+            InlineKeyboardButton(
+                "📝 Edit Question Text",
+                callback_data=f"pdfq_ed_{uid}_question",
+            )
+        ]
+    ]
+
+    for i, option in enumerate(options):
+        buttons.append([
+            InlineKeyboardButton(
+                f"✏️ Edit Option {i + 1}",
+                callback_data=f"pdfq_ed_{uid}_opt_{i}",
+            ),
+            InlineKeyboardButton(
+                f"🗑 Remove {i + 1}",
+                callback_data=f"pdfq_ed_{uid}_del_{i}",
+            ),
+        ])
+
+    if len(options) < 10:
+        buttons.append([
+            InlineKeyboardButton(
+                "➕ Add New Option",
+                callback_data=f"pdfq_ed_{uid}_add",
+            )
+        ])
+
+    buttons.extend([
+        [
+            InlineKeyboardButton(
+                "✅ Change Correct Answer",
+                callback_data=f"pdfq_ed_{uid}_answer",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "↩️ Back to Review",
+                callback_data=f"pdfq_ed_{uid}_back",
+            )
+        ],
+    ])
+
+    return InlineKeyboardMarkup(buttons)
+
+
+# ============================================================
+# REVIEW TEXT
+# ============================================================
+
+def _review_text(sess: dict, index: int) -> str:
+    questions = sess.get("questions", [])
+    skipped = sess.get("skipped", set())
+
+    if not questions:
+        return "❌ No questions available."
+
+    index = max(0, min(index, len(questions) - 1))
+    q = questions[index]
+
+    status = "⏭ SKIPPED" if index in skipped else "✅ KEEP"
+    correct_ids = q.get("correct_option_id", [])
+
+    if not isinstance(correct_ids, list):
+        correct_ids = [correct_ids]
+
+    question_text = escape(str(q.get("question", "")))
+
+    text = (
+        "📋 <b>PDF QUESTION REVIEW</b>\n"
+        f"Question {index + 1}/{len(questions)}\n"
+        f"Status: {status}\n\n"
+        f"<b>{question_text}</b>\n\n"
+    )
+
+    options = q.get("options", [])
+
+    for i, option in enumerate(options):
+        mark = "✅" if i in correct_ids else "▫️"
+        text += f"{mark} {escape(str(option))}\n"
+
+    text += (
+        "\nUse Previous/Next to review questions.\n"
+        "You can edit the question, options and correct answer.\n"
+        "Skipped questions will not be included."
+    )
+
+    return text
+
+
+# ============================================================
+# REFRESH REVIEW MESSAGE
+# ============================================================
+
+async def _show_review_again(
+    ctx: ContextTypes.DEFAULT_TYPE,
+    uid: int,
+    sess: dict,
+) -> None:
+    """Restore the review screen after an edit."""
+
+    questions = sess.get("questions", [])
+    if not questions:
+        return
+
+    index = sess.get("review_index", 0)
+    index = max(0, min(index, len(questions) - 1))
+
+    chat_id = sess.get("review_chat_id", sess.get("chat_id", uid))
+    message_id = sess.get("review_message_id")
+
+    text = _review_text(sess, index)
+    markup = _review_kb(
+        uid,
+        index,
+        len(questions),
+        sess.setdefault("skipped", set()),
+    )
+
+    if message_id:
+        try:
+            await ctx.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text=text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=markup,
+            )
+            return
+        except Exception as exc:
+            logger.warning("Could not restore review message: %s", exc)
+
+    sent = await safe_send_message(
+        ctx,
+        chat_id,
+        text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=markup,
+    )
+
+    if sent:
+        sess["review_message_id"] = sent.message_id
+        sess["review_chat_id"] = sent.chat_id
+
+
+# ============================================================
+# MESSAGE HANDLER — PAGE RANGE, EDITING & QUIZ NAME
 # ============================================================
 
 async def pdfquiz_message_handler(
     update: Update,
     ctx: ContextTypes.DEFAULT_TYPE,
 ) -> bool:
-    """Handle page range and quiz-name text while setup is active."""
+    """Handle page range, edit inputs and quiz-name text."""
 
     try:
         if not update.message or not update.message.text:
@@ -276,7 +481,123 @@ async def pdfquiz_message_handler(
         if not sess:
             return False
 
+        # ----------------------------------------------------
+        # QUESTION EDIT INPUTS
+        # ----------------------------------------------------
+
+        edit_step = sess.get("step")
+
+        if edit_step in {
+            "edit_question",
+            "edit_option",
+            "edit_add_option",
+            "edit_answer",
+        }:
+            value = update.message.text.strip()
+            questions = sess.get("questions", [])
+            index = sess.get("review_index", 0)
+
+            if not questions or not (0 <= index < len(questions)):
+                sess["step"] = "review"
+                return True
+
+            q = questions[index]
+            options = q.setdefault("options", [])
+
+            if edit_step == "edit_question":
+                if not value:
+                    await safe_send_message(
+                        ctx,
+                        chat_id,
+                        "❌ Question cannot be empty. Send the corrected question:",
+                    )
+                    return True
+
+                q["question"] = value
+
+            elif edit_step == "edit_option":
+                option_index = sess.get("editing_option_index", -1)
+
+                if not (0 <= option_index < len(options)):
+                    sess["step"] = "review"
+                    await safe_send_message(
+                        ctx, chat_id, "❌ Invalid option. Please try again."
+                    )
+                    return True
+
+                if not value:
+                    await safe_send_message(
+                        ctx,
+                        chat_id,
+                        "❌ Option cannot be empty. Send the corrected option:",
+                    )
+                    return True
+
+                options[option_index] = value
+
+            elif edit_step == "edit_add_option":
+                if not value:
+                    await safe_send_message(
+                        ctx,
+                        chat_id,
+                        "❌ Option cannot be empty. Send the option again:",
+                    )
+                    return True
+
+                if len(options) >= 10:
+                    await safe_send_message(
+                        ctx, chat_id, "❌ Maximum 10 options are allowed."
+                    )
+                    return True
+
+                options.append(value)
+
+            elif edit_step == "edit_answer":
+                try:
+                    answer_ids = sorted({
+                        int(part.strip()) - 1
+                        for part in value.split(",")
+                    })
+
+                    if (
+                        not answer_ids
+                        or any(
+                            answer_id < 0 or answer_id >= len(options)
+                            for answer_id in answer_ids
+                        )
+                    ):
+                        raise ValueError
+
+                    q["correct_option_id"] = answer_ids
+
+                except (TypeError, ValueError):
+                    await safe_send_message(
+                        ctx,
+                        chat_id,
+                        "❌ Invalid answer number.\n\n"
+                        "Send the correct option number.\n"
+                        "Example: <code>2</code>\n"
+                        "For multiple correct answers: <code>2,4</code>",
+                        parse_mode=ParseMode.HTML,
+                    )
+                    return True
+
+            sess["step"] = "review"
+            sess.pop("editing_option_index", None)
+
+            await _show_review_again(ctx, user_id, sess)
+
+            await safe_send_message(
+                ctx,
+                chat_id,
+                "✅ Changes saved successfully.",
+            )
+            return True
+
+        # ----------------------------------------------------
         # PAGE RANGE
+        # ----------------------------------------------------
+
         if sess.get("step") == "pages":
             text = update.message.text.strip().lower()
 
@@ -308,7 +629,10 @@ async def pdfquiz_message_handler(
             )
             return True
 
+        # ----------------------------------------------------
         # QUIZ NAME
+        # ----------------------------------------------------
+
         if sess.get("step") == "title":
             quiz_name = update.message.text.strip()
 
@@ -422,94 +746,6 @@ async def pdfquiz_text_gate(
 
 
 # ============================================================
-# REVIEW KEYBOARD
-# ============================================================
-
-def _review_kb(
-    uid: int,
-    index: int,
-    total: int,
-    skipped: set,
-) -> InlineKeyboardMarkup:
-
-    skip_label = (
-        "↩️ Keep this question"
-        if index in skipped
-        else "⏭ Skip this question"
-    )
-
-    buttons = [
-        [
-            InlineKeyboardButton(
-                "⏮ Previous",
-                callback_data=f"pdfq_rv_{uid}_prev",
-            ),
-            InlineKeyboardButton(
-                "Next ⏭",
-                callback_data=f"pdfq_rv_{uid}_next",
-            ),
-        ],
-        [
-            InlineKeyboardButton(
-                skip_label,
-                callback_data=f"pdfq_rv_{uid}_toggle",
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "✅ Approve & Create Quiz",
-                callback_data=f"pdfq_rv_{uid}_finish",
-            )
-        ],
-    ]
-
-    return InlineKeyboardMarkup(buttons)
-
-
-# ============================================================
-# REVIEW TEXT
-# ============================================================
-
-def _review_text(sess: dict, index: int) -> str:
-    questions = sess.get("questions", [])
-    skipped = sess.get("skipped", set())
-
-    if not questions:
-        return "❌ No questions available."
-
-    index = max(0, min(index, len(questions) - 1))
-    q = questions[index]
-
-    status = "⏭ SKIPPED" if index in skipped else "✅ KEEP"
-    correct_ids = q.get("correct_option_id", [])
-
-    if not isinstance(correct_ids, list):
-        correct_ids = [correct_ids]
-
-    question_text = escape(str(q.get("question", "")))
-
-    text = (
-        "📋 <b>PDF QUESTION REVIEW</b>\n"
-        f"Question {index + 1}/{len(questions)}\n"
-        f"Status: {status}\n\n"
-        f"<b>{question_text}</b>\n\n"
-    )
-
-    options = q.get("options", [])
-
-    for i, option in enumerate(options):
-        mark = "✅" if i in correct_ids else "▫️"
-        text += f"{mark} {escape(str(option))}\n"
-
-    text += (
-        "\nUse Previous/Next to review questions.\n"
-        "Skipped questions will not be included."
-    )
-
-    return text
-
-
-# ============================================================
 # PDF QUIZ CALLBACK
 # ============================================================
 
@@ -562,6 +798,217 @@ async def pdfquiz_callback(
         msg = query.message
 
         # ----------------------------------------------------
+        # EDIT QUESTION / OPTIONS
+        # ----------------------------------------------------
+
+        if step == "ed":
+            questions = sess.get("questions", [])
+            index = sess.get("review_index", 0)
+
+            if not questions or not (0 <= index < len(questions)):
+                await msg.edit_text("❌ Question not found.")
+                return
+
+            q = questions[index]
+            options = q.setdefault("options", [])
+
+            sess["review_message_id"] = msg.message_id
+            sess["review_chat_id"] = msg.chat_id
+
+            # EDIT MENU
+            if value == "menu":
+                sess["step"] = "review"
+
+                await msg.edit_text(
+                    "✏️ <b>EDIT QUESTION</b>\n\n"
+                    "Choose what you want to change.\n"
+                    "You can edit the question, individual options, "
+                    "or the correct answer.",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=_edit_menu_kb(uid, q),
+                )
+                return
+
+            # BACK TO REVIEW
+            if value == "back":
+                sess["step"] = "review"
+                await msg.edit_text(
+                    _review_text(sess, index),
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=_review_kb(
+                        uid,
+                        index,
+                        len(questions),
+                        sess.setdefault("skipped", set()),
+                    ),
+                )
+                return
+
+            # EDIT QUESTION TEXT
+            if value == "question":
+                sess["step"] = "edit_question"
+
+                await msg.edit_text(
+                    "📝 <b>EDIT QUESTION TEXT</b>\n\n"
+                    "Send the corrected question text.\n\n"
+                    "Malayalam and other languages are supported.\n"
+                    "Your text will be saved exactly as you send it.",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton(
+                            "↩️ Cancel",
+                            callback_data=f"pdfq_ed_{uid}_back",
+                        )
+                    ]]),
+                )
+                return
+
+            # EDIT AN INDIVIDUAL OPTION
+            if value and value.startswith("opt_"):
+                try:
+                    option_index = int(value.split("_", 1)[1])
+                except ValueError:
+                    return
+
+                if not (0 <= option_index < len(options)):
+                    await query.answer("Invalid option.", show_alert=True)
+                    return
+
+                sess["step"] = "edit_option"
+                sess["editing_option_index"] = option_index
+
+                await msg.edit_text(
+                    f"✏️ <b>EDIT OPTION {option_index + 1}</b>\n\n"
+                    f"Current option:\n"
+                    f"<code>{escape(str(options[option_index]))}</code>\n\n"
+                    "Send the replacement option text.",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton(
+                            "↩️ Cancel",
+                            callback_data=f"pdfq_ed_{uid}_back",
+                        )
+                    ]]),
+                )
+                return
+
+            # ADD AN OPTION
+            if value == "add":
+                if len(options) >= 10:
+                    await query.answer(
+                        "Maximum 10 options are allowed.",
+                        show_alert=True,
+                    )
+                    return
+
+                sess["step"] = "edit_add_option"
+
+                await msg.edit_text(
+                    "➕ <b>ADD NEW OPTION</b>\n\n"
+                    "Send the new option text.",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton(
+                            "↩️ Cancel",
+                            callback_data=f"pdfq_ed_{uid}_back",
+                        )
+                    ]]),
+                )
+                return
+
+            # REMOVE AN OPTION
+            if value and value.startswith("del_"):
+                try:
+                    option_index = int(value.split("_", 1)[1])
+                except ValueError:
+                    return
+
+                if not (0 <= option_index < len(options)):
+                    await query.answer("Invalid option.", show_alert=True)
+                    return
+
+                if len(options) <= 2:
+                    await query.answer(
+                        "At least 2 options must remain.",
+                        show_alert=True,
+                    )
+                    return
+
+                removed_option = options.pop(option_index)
+
+                old_correct = q.get("correct_option_id", [])
+                if not isinstance(old_correct, list):
+                    old_correct = [old_correct]
+
+                new_correct = []
+
+                for correct_id in old_correct:
+                    if not isinstance(correct_id, int):
+                        continue
+
+                    if correct_id == option_index:
+                        continue
+
+                    if correct_id > option_index:
+                        correct_id -= 1
+
+                    new_correct.append(correct_id)
+
+                q["correct_option_id"] = new_correct
+                sess["step"] = "review"
+
+                await msg.edit_text(
+                    "🗑 <b>Option removed.</b>\n\n"
+                    f"Removed: {escape(str(removed_option))}\n\n"
+                    + _review_text(sess, index),
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=_review_kb(
+                        uid,
+                        index,
+                        len(questions),
+                        sess.setdefault("skipped", set()),
+                    ),
+                )
+
+                if not new_correct:
+                    await safe_send_message(
+                        ctx,
+                        msg.chat_id,
+                        "⚠️ The removed option was marked as correct.\n"
+                        "Please use Edit Question / Options → "
+                        "Change Correct Answer to select the new answer.",
+                    )
+                return
+
+            # CHANGE CORRECT ANSWER
+            if value == "answer":
+                sess["step"] = "edit_answer"
+
+                option_lines = "\n".join(
+                    f"{i + 1}. {escape(str(option))}"
+                    for i, option in enumerate(options)
+                )
+
+                await msg.edit_text(
+                    "✅ <b>CHANGE CORRECT ANSWER</b>\n\n"
+                    f"{option_lines}\n\n"
+                    "Send the correct option number.\n"
+                    "Example: <code>2</code>\n\n"
+                    "For multiple correct answers, use commas:\n"
+                    "<code>2,4</code>",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton(
+                            "↩️ Cancel",
+                            callback_data=f"pdfq_ed_{uid}_back",
+                        )
+                    ]]),
+                )
+                return
+
+            return
+
+        # ----------------------------------------------------
         # QUESTION REVIEW
         # ----------------------------------------------------
 
@@ -600,6 +1047,7 @@ async def pdfquiz_callback(
                     )
                     return
 
+                # Do not include skipped questions.
                 sess["questions"] = approved
                 sess["step"] = "title"
 
@@ -615,6 +1063,9 @@ async def pdfquiz_callback(
 
             index = max(0, min(index, len(questions) - 1))
             sess["review_index"] = index
+            sess["review_message_id"] = msg.message_id
+            sess["review_chat_id"] = msg.chat_id
+            sess["step"] = "review"
 
             await msg.edit_text(
                 _review_text(sess, index),
@@ -633,7 +1084,17 @@ async def pdfquiz_callback(
         # ----------------------------------------------------
 
         if step == "count":
-            sess["count"] = int(value)
+            try:
+                count = int(value)
+            except (TypeError, ValueError):
+                await query.answer("Invalid question count.", show_alert=True)
+                return
+
+            if count not in (5, 10, 15, 20, 25, 30, 40, 50):
+                await query.answer("Invalid question count.", show_alert=True)
+                return
+
+            sess["count"] = count
 
             # PDF quiz defaults
             sess["diff"] = "moderate"
@@ -815,6 +1276,8 @@ async def _pdfquiz_generate_flow(
         sess["review_index"] = 0
         sess["review_complete"] = False
         sess["step"] = "review"
+        sess["review_message_id"] = msg.message_id
+        sess["review_chat_id"] = msg.chat_id
 
         PDF_QUIZ_SESSIONS[uid] = sess
 
