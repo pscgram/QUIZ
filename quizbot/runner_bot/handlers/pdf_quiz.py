@@ -2,7 +2,6 @@
 Advance Quiz Bot — Open Source Project
 This project was originally developed by Gagan (github.com/devgaganin).
 Reference: https://t.me/advance_quiz_bot
-The codebase has been reviewed and verified with the assistance of Claude AI.
 """
 
 from __future__ import annotations
@@ -42,7 +41,10 @@ logger = logging.getLogger(__name__)
 # PDF QUIZ COMMAND
 # ============================================================
 
-async def pdfquiz_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+async def pdfquiz_command(
+    update: Update,
+    ctx: ContextTypes.DEFAULT_TYPE,
+) -> None:
     """Start PDF quiz creation by replying to a PDF."""
 
     if not update.message:
@@ -138,7 +140,6 @@ async def pdfquiz_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
                 return
 
             sess = PDF_QUIZ_SESSIONS[user_id]
-
             sess["page_start"] = start_p
             sess["page_end"] = end_p
             sess["step"] = "count"
@@ -255,62 +256,160 @@ async def _count_pdf_pages(pdf_path: str) -> int:
 
 
 # ============================================================
-# PAGE RANGE MESSAGE HANDLER
+# MESSAGE HANDLER — PAGE RANGE & QUIZ NAME
 # ============================================================
 
 async def pdfquiz_message_handler(
     update: Update,
     ctx: ContextTypes.DEFAULT_TYPE,
 ) -> bool:
-    """Handle page range text while PDF quiz setup is active."""
+    """Handle page range and quiz-name text while setup is active."""
 
     try:
-        if not update.message:
+        if not update.message or not update.message.text:
             return False
 
         user_id = update.message.from_user.id
         chat_id = update.message.chat_id
-
         sess = PDF_QUIZ_SESSIONS.get(user_id)
 
-        if not sess or sess.get("step") != "pages":
+        if not sess:
             return False
 
-        text = update.message.text.strip().lower()
+        # PAGE RANGE
+        if sess.get("step") == "pages":
+            text = update.message.text.strip().lower()
 
-        try:
-            start_p, end_p = _parse_range(
-                text,
-                sess.get("total_pages", 0),
-            )
-        except (ValueError, IndexError):
+            try:
+                start_p, end_p = _parse_range(
+                    text, sess.get("total_pages", 0)
+                )
+            except (ValueError, IndexError):
+                await safe_send_message(
+                    ctx,
+                    chat_id,
+                    "❌ Invalid format. Send <code>1-10</code> or <code>all</code>.",
+                    parse_mode=ParseMode.HTML,
+                )
+                return True
+
+            sess["page_start"] = start_p
+            sess["page_end"] = end_p
+            sess["step"] = "count"
+
             await safe_send_message(
                 ctx,
                 chat_id,
-                "❌ Invalid format. Send like "
-                "<code>1-10</code> or <code>all</code>.",
+                f"✅ Pages <b>{start_p}–{end_p}</b> selected "
+                f"({end_p - start_p + 1} page(s))\n\n"
+                "How many questions should I generate?",
                 parse_mode=ParseMode.HTML,
+                reply_markup=_count_kb(user_id),
             )
             return True
 
-        sess["page_start"] = start_p
-        sess["page_end"] = end_p
-        sess["step"] = "count"
+        # QUIZ NAME
+        if sess.get("step") == "title":
+            quiz_name = update.message.text.strip()
 
-        await safe_send_message(
-            ctx,
-            chat_id,
-            f"✅ Pages <b>{start_p}–{end_p}</b> selected "
-            f"({end_p - start_p + 1} page(s))\n\n"
-            "How many questions should I generate?",
-            parse_mode=ParseMode.HTML,
-            reply_markup=_count_kb(user_id),
-        )
+            if not quiz_name:
+                await safe_send_message(
+                    ctx,
+                    chat_id,
+                    "❌ Quiz name cannot be empty. Send a quiz name:",
+                )
+                return True
 
-        return True
+            if len(quiz_name) > 80:
+                await safe_send_message(
+                    ctx,
+                    chat_id,
+                    "❌ Quiz name must be 80 characters or fewer. Try again:",
+                )
+                return True
+
+            approved = sess.get("questions", [])
+            chat_id = sess.get("chat_id", user_id)
+            chat_type = sess.get("chat_type", "private")
+            pdf_path = sess.get("pdf_path", "")
+
+            PDF_QUIZ_SESSIONS.pop(user_id, None)
+            await remove_file(pdf_path)
+
+            await safe_send_message(
+                ctx,
+                chat_id,
+                f"✅ Quiz name: <b>{escape(quiz_name)}</b>\n"
+                "🚀 Creating quiz...",
+                parse_mode=ParseMode.HTML,
+            )
+
+            qid = await _launch_ai_quiz(
+                user_id,
+                ctx,
+                approved,
+                "PDF Quiz",
+                20,
+                0,
+                1,
+                False,
+                False,
+                shuffle_o_count=0,
+                chat_id=chat_id,
+                chat_type=chat_type,
+                update=update,
+                show_explanation=True,
+                persist=True,
+                quiz_name=quiz_name,
+            )
+
+            if qid:
+                from quizbot.shared.quiz_links import (
+                    player_quiz_link,
+                    player_group_link,
+                    player_share_link,
+                )
+
+                await safe_send_message(
+                    ctx,
+                    chat_id,
+                    "✅ <b>PDF Quiz saved permanently!</b>\n\n"
+                    "Your quiz is ready. Use the links below:",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=InlineKeyboardMarkup(
+                        [
+                            [
+                                InlineKeyboardButton(
+                                    "▶️ Start Quiz",
+                                    url=player_quiz_link(qid),
+                                )
+                            ],
+                            [
+                                InlineKeyboardButton(
+                                    "👥 Add Player Bot to Group",
+                                    url=player_group_link(qid),
+                                )
+                            ],
+                            [
+                                InlineKeyboardButton(
+                                    "🔗 Share Quiz",
+                                    url=player_share_link(qid),
+                                )
+                            ],
+                        ]
+                    ),
+                )
+
+            return True
+
+        return False
 
     except Exception as e:
-        logger.error("pdfquiz_message_handler error: %s", e, exc_info=True)
+        logger.error(
+            "pdfquiz_message_handler error: %s",
+            e,
+            exc_info=True,
+        )
         return False
 
 
@@ -382,7 +481,6 @@ def _review_text(sess: dict, index: int) -> str:
     q = questions[index]
 
     status = "⏭ SKIPPED" if index in skipped else "✅ KEEP"
-
     correct_ids = q.get("correct_option_id", [])
 
     if not isinstance(correct_ids, list):
@@ -412,14 +510,14 @@ def _review_text(sess: dict, index: int) -> str:
 
 
 # ============================================================
-# PDF QUIZ CALLBACK HANDLER
+# PDF QUIZ CALLBACK
 # ============================================================
 
 async def pdfquiz_callback(
     update: Update,
     ctx: ContextTypes.DEFAULT_TYPE,
 ) -> None:
-    """Handle pdfq_ callbacks."""
+    """Handle PDF quiz callbacks."""
 
     try:
         query = update.callback_query
@@ -448,11 +546,10 @@ async def pdfquiz_callback(
             await query.answer("❌ Not your session", show_alert=True)
             return
 
-        await query.answer()
-
         sess = PDF_QUIZ_SESSIONS.get(uid)
 
         if not sess:
+            await query.answer()
             try:
                 await query.message.edit_text(
                     "❌ Session expired. Please start /pdfquiz again."
@@ -461,10 +558,11 @@ async def pdfquiz_callback(
                 pass
             return
 
+        await query.answer()
         msg = query.message
 
         # ----------------------------------------------------
-        # QUESTION REVIEW: PREVIOUS / NEXT / KEEP / SKIP / FINISH
+        # QUESTION REVIEW
         # ----------------------------------------------------
 
         if step == "rv":
@@ -491,48 +589,27 @@ async def pdfquiz_callback(
 
             elif value == "finish":
                 approved = [
-                    q
-                    for i, q in enumerate(questions)
+                    q for i, q in enumerate(questions)
                     if i not in skipped
                 ]
 
                 if not approved:
                     await msg.edit_text(
-                        "❌ You skipped all questions.\n"
-                        "Keep at least one question before proceeding."
+                        "❌ All questions are skipped.\n"
+                        "Keep at least one question to continue."
                     )
                     return
 
                 sess["questions"] = approved
-                sess["review_complete"] = True
-                sess["step"] = "timer"
-
-                timer_kb = InlineKeyboardMarkup(
-                    [
-                        [
-                            InlineKeyboardButton(
-                                f"{t}s",
-                                callback_data=f"pdfq_timer_{uid}_{t}",
-                            )
-                            for t in (10, 15, 20)
-                        ],
-                        [
-                            InlineKeyboardButton(
-                                f"{t}s",
-                                callback_data=f"pdfq_timer_{uid}_{t}",
-                            )
-                            for t in (25, 30, 45)
-                        ],
-                    ]
-                )
+                sess["step"] = "title"
 
                 await msg.edit_text(
-                    "✅ <b>Review completed!</b>\n\n"
-                    f"Approved: <b>{len(approved)}</b> questions\n"
-                    f"Skipped: <b>{len(skipped)}</b> questions\n\n"
-                    "⏱ Timer per question?",
+                    f"✅ Review approved!\n"
+                    f"Questions kept: {len(approved)}\n"
+                    f"Questions skipped: {len(skipped)}\n\n"
+                    "📝 <b>Send a name for this quiz.</b>\n\n"
+                    "Example: Kerala PSC – Indian Constitution",
                     parse_mode=ParseMode.HTML,
-                    reply_markup=timer_kb,
                 )
                 return
 
@@ -552,119 +629,35 @@ async def pdfquiz_callback(
             return
 
         # ----------------------------------------------------
-        # QUESTION COUNT
+        # QUESTION COUNT — START GENERATION
         # ----------------------------------------------------
 
         if step == "count":
             sess["count"] = int(value)
 
-            await msg.edit_text(
-                f"✅ {value} questions\n\nDifficulty?",
-                reply_markup=InlineKeyboardMarkup(
-                    [
-                        [
-                            InlineKeyboardButton(
-                                "🟡 Moderate",
-                                callback_data=f"pdfq_diff_{uid}_moderate",
-                            )
-                        ],
-                        [
-                            InlineKeyboardButton(
-                                "🔴 Hard",
-                                callback_data=f"pdfq_diff_{uid}_hard",
-                            )
-                        ],
-                        [
-                            InlineKeyboardButton(
-                                "💀 Extreme Hard",
-                                callback_data=f"pdfq_diff_{uid}_extreme",
-                            )
-                        ],
-                    ]
-                ),
-            )
-
-        # ----------------------------------------------------
-        # DIFFICULTY
-        # ----------------------------------------------------
-
-        elif step == "diff":
-            sess["diff"] = value
-
-            await msg.edit_text(
-                f"✅ {value.title()}\n\nExam style?",
-                reply_markup=InlineKeyboardMarkup(
-                    [
-                        [
-                            InlineKeyboardButton(
-                                "📋 SSC Type",
-                                callback_data=f"pdfq_exam_{uid}_ssc",
-                            )
-                        ],
-                        [
-                            InlineKeyboardButton(
-                                "🏛 Civil Services",
-                                callback_data=f"pdfq_exam_{uid}_civil",
-                            )
-                        ],
-                        [
-                            InlineKeyboardButton(
-                                "📝 Common One Day",
-                                callback_data=f"pdfq_exam_{uid}_oneway",
-                            )
-                        ],
-                    ]
-                ),
-            )
-
-        # ----------------------------------------------------
-        # EXAM STYLE
-        # ----------------------------------------------------
-
-        elif step == "exam":
-            sess["exam"] = value
-
-            await msg.edit_text(
-                "✅ Exam style set\n\nLanguage?",
-                reply_markup=InlineKeyboardMarkup(
-                    [
-                        [
-                            InlineKeyboardButton(
-                                "🇬🇧 English",
-                                callback_data=f"pdfq_lang_{uid}_en",
-                            ),
-                            InlineKeyboardButton(
-                                "🇮🇳 Hindi",
-                                callback_data=f"pdfq_lang_{uid}_hi",
-                            ),
-                        ],
-                        [
-                            InlineKeyboardButton(
-                                "🔤 Hinglish",
-                                callback_data=f"pdfq_lang_{uid}_hinglish",
-                            )
-                        ],
-                    ]
-                ),
-            )
-
-        # ----------------------------------------------------
-        # LANGUAGE: START GENERATION
-        # ----------------------------------------------------
-
-        elif step == "lang":
-            sess["lang"] = value
+            # PDF quiz defaults
+            sess["diff"] = "moderate"
+            sess["exam"] = "oneway"
+            sess["lang"] = "auto"
+            sess["timer"] = 20
+            sess["neg"] = 0
+            sess["cm"] = 1
+            sess["shuffle_q"] = False
+            sess["shuffle_o"] = False
+            sess["shuffle_o_count"] = 0
+            sess["show_explanation"] = True
 
             pages_count = (
                 sess["page_end"] - sess["page_start"] + 1
             )
 
             await msg.edit_text(
-                "📄 <b>Starting page-by-page generation...</b>\n\n"
+                "📄 <b>Starting PDF extraction...</b>\n\n"
                 f"📄 Pages: {sess['page_start']}–{sess['page_end']} "
                 f"({pages_count} pages)\n"
                 f"🎯 Target: {sess['count']} questions\n\n"
-                "🔍 Sending each page to Gemini vision...",
+                "🔍 Processing pages individually.\n"
+                "⏳ Please wait...",
                 parse_mode=ParseMode.HTML,
             )
 
@@ -674,309 +667,12 @@ async def pdfquiz_callback(
                 _pdfquiz_generate_flow(uid, ctx, msg, sess),
                 name=f"pdfquiz_gen_{uid}",
             )
-
-        # ----------------------------------------------------
-        # TIMER
-        # ----------------------------------------------------
-
-        elif step == "timer":
-            sess["timer"] = int(value)
-
-            await msg.edit_text(
-                f"✅ Timer: {value}s\n\n➖ Negative marking?",
-                reply_markup=InlineKeyboardMarkup(
-                    [
-                        [
-                            InlineKeyboardButton(
-                                "None",
-                                callback_data=f"pdfq_neg_{uid}_0",
-                            ),
-                            InlineKeyboardButton(
-                                "1/4",
-                                callback_data=f"pdfq_neg_{uid}_0.25",
-                            ),
-                            InlineKeyboardButton(
-                                "1/3",
-                                callback_data=f"pdfq_neg_{uid}_0.333",
-                            ),
-                        ],
-                        [
-                            InlineKeyboardButton(
-                                "1/2",
-                                callback_data=f"pdfq_neg_{uid}_0.5",
-                            ),
-                            InlineKeyboardButton(
-                                "1",
-                                callback_data=f"pdfq_neg_{uid}_1.0",
-                            ),
-                        ],
-                    ]
-                ),
-            )
-
-        # ----------------------------------------------------
-        # NEGATIVE MARKING
-        # ----------------------------------------------------
-
-        elif step == "neg":
-            sess["neg"] = float(value)
-
-            await msg.edit_text(
-                f"✅ Negative: {value}\n\n✅ Correct mark?",
-                reply_markup=InlineKeyboardMarkup(
-                    [
-                        [
-                            InlineKeyboardButton(
-                                str(n),
-                                callback_data=f"pdfq_cm_{uid}_{n}",
-                            )
-                            for n in (1, 2, 3, 4)
-                        ]
-                    ]
-                ),
-            )
-
-        # ----------------------------------------------------
-        # CORRECT MARK
-        # ----------------------------------------------------
-
-        elif step == "cm":
-            sess["cm"] = int(value)
-
-            await msg.edit_text(
-                f"✅ Correct: +{value}\n\n🔀 Shuffle?",
-                reply_markup=InlineKeyboardMarkup(
-                    [
-                        [
-                            InlineKeyboardButton(
-                                "🔀 Questions",
-                                callback_data=f"pdfq_shuffle_{uid}_q",
-                            ),
-                            InlineKeyboardButton(
-                                "🔀 Options",
-                                callback_data=f"pdfq_shuffle_{uid}_o",
-                            ),
-                            InlineKeyboardButton(
-                                "🔀 Both",
-                                callback_data=f"pdfq_shuffle_{uid}_b",
-                            ),
-                        ],
-                        [
-                            InlineKeyboardButton(
-                                "⏭ No Shuffle",
-                                callback_data=f"pdfq_shuffle_{uid}_none",
-                            )
-                        ],
-                    ]
-                ),
-            )
-
-        # ----------------------------------------------------
-        # SHUFFLE
-        # ----------------------------------------------------
-
-        elif step == "shuffle":
-            sess["shuffle_q"] = value in ("q", "b")
-            sess["shuffle_o"] = value in ("o", "b")
-
-            slbl = {
-                "q": "Questions",
-                "o": "Options",
-                "b": "Both",
-                "none": "None",
-            }.get(value, "None")
-
-            if sess["shuffle_o"]:
-                await msg.edit_text(
-                    f"✅ Shuffle: {slbl}\n\n"
-                    "🔀 Shuffle how many options?",
-                    reply_markup=InlineKeyboardMarkup(
-                        [
-                            [
-                                InlineKeyboardButton(
-                                    "First 2",
-                                    callback_data=f"pdfq_shufflecount_{uid}_2",
-                                ),
-                                InlineKeyboardButton(
-                                    "First 4",
-                                    callback_data=f"pdfq_shufflecount_{uid}_4",
-                                ),
-                            ],
-                            [
-                                InlineKeyboardButton(
-                                    "All",
-                                    callback_data=f"pdfq_shufflecount_{uid}_all",
-                                )
-                            ],
-                        ]
-                    ),
-                )
-            else:
-                sess["shuffle_o_count"] = 0
-
-                await msg.edit_text(
-                    f"✅ Shuffle: {slbl}\n\n"
-                    "💡 Show explanation after each question?",
-                    reply_markup=InlineKeyboardMarkup(
-                        [
-                            [
-                                InlineKeyboardButton(
-                                    "✅ Yes",
-                                    callback_data=f"pdfq_ex_{uid}_yes",
-                                ),
-                                InlineKeyboardButton(
-                                    "❌ No (default)",
-                                    callback_data=f"pdfq_ex_{uid}_no",
-                                ),
-                            ]
-                        ]
-                    ),
-                )
-
-        # ----------------------------------------------------
-        # OPTION SHUFFLE COUNT
-        # ----------------------------------------------------
-
-        elif step == "shufflecount":
-            sess["shuffle_o_count"] = (
-                0 if value == "all" else int(value)
-            )
-
-            label = "All" if value == "all" else f"First {value}"
-
-            await msg.edit_text(
-                f"✅ Options shuffle range: {label}\n\n"
-                "💡 Show explanation after each question?",
-                reply_markup=InlineKeyboardMarkup(
-                    [
-                        [
-                            InlineKeyboardButton(
-                                "✅ Yes",
-                                callback_data=f"pdfq_ex_{uid}_yes",
-                            ),
-                            InlineKeyboardButton(
-                                "❌ No (default)",
-                                callback_data=f"pdfq_ex_{uid}_no",
-                            ),
-                        ]
-                    ]
-                ),
-            )
-
-        # ----------------------------------------------------
-        # EXPLANATION AND FINAL QUIZ CREATION
-        # ----------------------------------------------------
-
-        elif step == "ex":
-            sess["show_explanation"] = value == "yes"
-
-            questions = sess.get("questions", [])
-
-            neg_str = (
-                "None"
-                if sess["neg"] == 0
-                else f"-{sess['neg']}"
-            )
-
-            slbl = (
-                "Both"
-                if (sess.get("shuffle_q") and sess.get("shuffle_o"))
-                else "Questions"
-                if sess.get("shuffle_q")
-                else "Options"
-                if sess.get("shuffle_o")
-                else "None"
-            )
-
-            await msg.edit_text(
-                "📄 <b>PDF Quiz Ready!</b>\n\n"
-                f"📋 <b>Questions:</b> {len(questions)}\n"
-                f"⏱ <b>Timer:</b> {sess['timer']}s\n"
-                f"✅ <b>Correct:</b> +{sess['cm']}\n"
-                f"➖ <b>Negative:</b> {neg_str}\n"
-                f"🔀 <b>Shuffle:</b> {slbl}\n"
-                f"💡 <b>Explanation:</b> "
-                f"{'✅ Yes' if sess['show_explanation'] else '❌ No'}\n\n"
-                "▶️ Starting quiz...",
-                parse_mode=ParseMode.HTML,
-            )
-
-            chat_id = sess.get("chat_id", uid)
-            chat_type = sess.get("chat_type", "private")
-            show_expl = sess.get("show_explanation", False)
-
-            PDF_QUIZ_SESSIONS.pop(uid, None)
-
-            await remove_file(sess.get("pdf_path", ""))
-
-            await asyncio.sleep(1)
-
-            qid = await _launch_ai_quiz(
-                uid,
-                ctx,
-                questions,
-                "PDF Quiz",
-                sess["timer"],
-                sess["neg"],
-                sess["cm"],
-                sess.get("shuffle_q", False),
-                sess.get("shuffle_o", False),
-                shuffle_o_count=sess.get("shuffle_o_count", 0),
-                chat_id=chat_id,
-                chat_type=chat_type,
-                update=update,
-                show_explanation=show_expl,
-                persist=True,
-            )
-
-            # ------------------------------------------------
-            # PERMANENT QUIZ LINKS
-            # ------------------------------------------------
-
-            if qid:
-                from quizbot.shared.quiz_links import (
-                    player_quiz_link,
-                    player_group_link,
-                    player_share_link,
-                )
-
-                await safe_send_message(
-                    ctx,
-                    chat_id,
-                    "✅ <b>PDF Quiz saved permanently!</b>\n\n"
-                    "Your quiz is ready. Use these links to play or share it:",
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=InlineKeyboardMarkup(
-                        [
-                            [
-                                InlineKeyboardButton(
-                                    "▶️ Start Quiz",
-                                    url=player_quiz_link(qid),
-                                )
-                            ],
-                            [
-                                InlineKeyboardButton(
-                                    "👥 Add Player Bot to Group",
-                                    url=player_group_link(qid),
-                                )
-                            ],
-                            [
-                                InlineKeyboardButton(
-                                    "🔗 Share Quiz",
-                                    url=player_share_link(qid),
-                                )
-                            ],
-                        ]
-                    ),
-                )
+            return
 
     except Exception as e:
         logger.error("pdfquiz_callback error: %s", e, exc_info=True)
 
 
-# Continue — PDF generation function
-
-```python
 # ============================================================
 # PDF QUESTION GENERATION FLOW
 # ============================================================
@@ -1053,7 +749,8 @@ async def _pdfquiz_generate_flow(
 
             hint = max(
                 1,
-                (questions_remaining + pages_remaining - 1) // pages_remaining,
+                (questions_remaining + pages_remaining - 1)
+                // pages_remaining,
             )
 
             try:
@@ -1112,10 +809,7 @@ async def _pdfquiz_generate_flow(
 
         all_questions = all_questions[:total_q]
 
-        # ----------------------------------------------------
-        # START REVIEW — QUIZ IS NOT CREATED HERE
-        # ----------------------------------------------------
-
+        # START REVIEW — QUIZ NOT CREATED YET
         sess["questions"] = all_questions
         sess["skipped"] = set()
         sess["review_index"] = 0
@@ -1159,7 +853,6 @@ async def _pdfquiz_generate_flow(
             except Exception:
                 pass
 
-        # Keep PDF until review is finished, otherwise remove on failed flow.
         if uid not in PDF_QUIZ_SESSIONS:
             await remove_file(pdf_path)
 
