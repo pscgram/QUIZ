@@ -1,3 +1,4 @@
+
 """
 Advance Quiz Bot — Open Source Project
 This project was originally developed by Gagan (github.com/devgaganin).
@@ -11,6 +12,7 @@ import asyncio
 import logging
 
 from pyrogram import Client
+from pyrogram.types import BotCommand
 
 from quizbot.shared import config
 
@@ -30,22 +32,8 @@ def build_client() -> Client:
 
 
 async def run_creator_bot(stop_event: asyncio.Event | None = None) -> None:
-    """Start the Creator Bot and block until the process is asked to stop.
+    """Start the Creator Bot and block until the process is asked to stop."""
 
-    Uses `app.start()` / (wait) / `app.stop()` explicitly rather than
-    `Client.run()`, since `run()` calls `asyncio.get_event_loop().
-    run_until_complete(...)` internally and would conflict with the Runner
-    Bot also running in this same shared event loop.
-
-    We intentionally do NOT call `pyrogram.idle()` here: that helper installs
-    its own OS signal handlers and is meant for a single-bot process, which
-    would conflict when the Runner Bot is also running as a sibling task in
-    this process (see `quizbot/run.py`, which installs its own SIGINT/SIGTERM
-    handling and cancels both bot tasks on shutdown). Instead we just await
-    an `asyncio.Event` that the caller cancels/sets on shutdown -- if the
-    caller doesn't supply one (e.g. running this bot standalone) we create
-    one and wait on it forever, relying on task cancellation to stop us.
-    """
     app = build_client()
 
     from .handlers import register
@@ -53,6 +41,40 @@ async def run_creator_bot(stop_event: asyncio.Event | None = None) -> None:
     register(app)
 
     await app.start()
+
+    # Register Telegram Menu commands.
+    try:
+        await app.set_bot_commands([
+            BotCommand("start", "Start the bot"),
+            BotCommand("help", "Command guide"),
+            BotCommand("features", "View bot features"),
+            BotCommand("create", "Create a quiz"),
+            BotCommand("done", "Finish quiz creation"),
+            BotCommand("cancel", "Cancel current operation"),
+            BotCommand("myquizzes", "View your quizzes"),
+            BotCommand("edit", "Edit a quiz"),
+            BotCommand("del", "Delete a quiz"),
+            BotCommand("delall", "Delete all quizzes"),
+            BotCommand("pay", "View premium plans"),
+            BotCommand("settings", "Creator settings"),
+            BotCommand("batch", "View batches"),
+            BotCommand("createbatch", "Create a batch"),
+            BotCommand("searchbatch", "Search batches"),
+            BotCommand("whtml", "HTML quiz report"),
+            BotCommand("testseries", "Generate test series"),
+            BotCommand("setkey", "Set AI API key"),
+            BotCommand("mykeys", "View AI keys"),
+            BotCommand("delkey", "Delete AI key"),
+            BotCommand("auth", "Manage authorized users"),
+            BotCommand("add", "Authorize a user"),
+            BotCommand("rem", "Remove authorization"),
+            BotCommand("remall", "Remove all authorizations"),
+            BotCommand("limit", "Check usage limits"),
+        ])
+        logger.info("Creator Bot menu commands registered.")
+    except Exception:
+        logger.exception("Failed to register Creator Bot menu commands.")
+
     me = await app.get_me()
     logger.info("Creator Bot started as @%s", me.username)
 
