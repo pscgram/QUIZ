@@ -34,10 +34,8 @@ def _kb(step: str, uid: int) -> InlineKeyboardMarkup:
 
     if step == "shufflecount":
         return InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("First 2", callback_data=p("shufflecount", 2)),
-                InlineKeyboardButton("First 4", callback_data=p("shufflecount", 4)),
-            ],
+            [InlineKeyboardButton("First 2", callback_data=p("shufflecount", 2)),
+             InlineKeyboardButton("First 4", callback_data=p("shufflecount", 4))],
             [InlineKeyboardButton("All", callback_data=p("shufflecount", "all"))],
         ])
 
@@ -51,26 +49,15 @@ def _kb(step: str, uid: int) -> InlineKeyboardMarkup:
     if step == "lang":
         items = list(AIQUIZ_LANG_UI.items())
         rows = [
-            [
-                InlineKeyboardButton(label, callback_data=p("lang", code))
-                for code, label in items[i:i + 2]
-            ]
+            [InlineKeyboardButton(label, callback_data=p("lang", code)) for code, label in items[i:i + 2]]
             for i in range(0, len(items), 2)
         ]
         return InlineKeyboardMarkup(rows)
 
     if step == "bilingual":
         return InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton(
-                    "✅ Yes — Bilingual",
-                    callback_data=p("bilingual", "yes"),
-                ),
-                InlineKeyboardButton(
-                    "❌ No — Single Lang",
-                    callback_data=p("bilingual", "no"),
-                ),
-            ],
+            [InlineKeyboardButton("✅ Yes — Bilingual", callback_data=p("bilingual", "yes")),
+             InlineKeyboardButton("❌ No — Single Lang", callback_data=p("bilingual", "no"))],
         ])
 
     if step == "lang2":
@@ -78,26 +65,23 @@ def _kb(step: str, uid: int) -> InlineKeyboardMarkup:
         lang1 = sess.get("lang", "en")
         items = [(c, l) for c, l in AIQUIZ_LANG_UI.items() if c != lang1]
         rows = [
-            [
-                InlineKeyboardButton(label, callback_data=p("lang2", code))
-                for code, label in items[i:i + 2]
-            ]
+            [InlineKeyboardButton(label, callback_data=p("lang2", code)) for code, label in items[i:i + 2]]
             for i in range(0, len(items), 2)
         ]
         return InlineKeyboardMarkup(rows)
 
     if step == "diff":
         return InlineKeyboardMarkup([
-            [InlineKeyboardButton("🟡 Moderate", callback_data=p("diff", "moderate"))],
-            [InlineKeyboardButton("🔴 Hard", callback_data=p("diff", "hard"))],
-            [InlineKeyboardButton("💀 Extreme Hard", callback_data=p("diff", "extreme"))],
+            [InlineKeyboardButton("\U0001F7E1 Moderate", callback_data=p("diff", "moderate"))],
+            [InlineKeyboardButton("\U0001F534 Hard", callback_data=p("diff", "hard"))],
+            [InlineKeyboardButton("\U0001F480 Extreme Hard", callback_data=p("diff", "extreme"))],
         ])
 
     if step == "exam":
         return InlineKeyboardMarkup([
-            [InlineKeyboardButton("📋 SSC Type", callback_data=p("exam", "ssc"))],
-            [InlineKeyboardButton("🏛 Civil Services", callback_data=p("exam", "civil"))],
-            [InlineKeyboardButton("📝 Common One Day", callback_data=p("exam", "oneway"))],
+            [InlineKeyboardButton("\U0001F4CB SSC Type", callback_data=p("exam", "ssc"))],
+            [InlineKeyboardButton("\U0001F3DB Civil Services", callback_data=p("exam", "civil"))],
+            [InlineKeyboardButton("\U0001F4DD Common One Day", callback_data=p("exam", "oneway"))],
         ])
 
     if step == "timer":
@@ -108,15 +92,11 @@ def _kb(step: str, uid: int) -> InlineKeyboardMarkup:
 
     if step == "neg":
         return InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("None", callback_data=p("neg", "0")),
-                InlineKeyboardButton("1/4", callback_data=p("neg", "0.25")),
-                InlineKeyboardButton("1/3", callback_data=p("neg", "0.333")),
-            ],
-            [
-                InlineKeyboardButton("1/2", callback_data=p("neg", "0.5")),
-                InlineKeyboardButton("1", callback_data=p("neg", "1.0")),
-            ],
+            [InlineKeyboardButton("None", callback_data=p("neg", "0")),
+             InlineKeyboardButton("1/4", callback_data=p("neg", "0.25")),
+             InlineKeyboardButton("1/3", callback_data=p("neg", "0.333"))],
+            [InlineKeyboardButton("1/2", callback_data=p("neg", "0.5")),
+             InlineKeyboardButton("1", callback_data=p("neg", "1.0"))],
         ])
 
     if step == "cm":
@@ -126,11 +106,9 @@ def _kb(step: str, uid: int) -> InlineKeyboardMarkup:
 
     if step == "shuffle":
         return InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("🔀 Questions", callback_data=p("shuffle", "q")),
-                InlineKeyboardButton("🔀 Options", callback_data=p("shuffle", "o")),
-                InlineKeyboardButton("🔀 Both", callback_data=p("shuffle", "b")),
-            ],
+            [InlineKeyboardButton("\U0001F500 Questions", callback_data=p("shuffle", "q")),
+             InlineKeyboardButton("\U0001F500 Options", callback_data=p("shuffle", "o")),
+             InlineKeyboardButton("\U0001F500 Both", callback_data=p("shuffle", "b"))],
             [InlineKeyboardButton("⏭ No Shuffle", callback_data=p("shuffle", "none"))],
         ])
 
@@ -150,7 +128,7 @@ async def _edit(msg, text: str, kb: InlineKeyboardMarkup = None) -> None:
 
 
 # ============================================================
-# QUIZ LAUNCHER — supports normal AI quiz and persistent PDF quiz
+# QUIZ LAUNCHER — normal AI quiz + persistent PDF quiz
 # ============================================================
 
 async def _launch_ai_quiz(
@@ -169,15 +147,16 @@ async def _launch_ai_quiz(
     update: Any = None,
     show_explanation: bool = False,
     persist: bool = False,
+    quiz_name: str = None,
 ) -> str:
-    """Launch a generated quiz; optionally persist it for deep-link sharing."""
+    """Launch a live AI quiz, or persist a PDF quiz before launching it."""
 
     from .quiz_play import run_group_quiz, start_private_quiz
 
     chat_id = chat_id or uid
     is_private = str(chat_type) in ("private", "ChatType.PRIVATE")
 
-    # Prevent overlapping quizzes in the same chat.
+    # Prevent overlapping quizzes before creating any permanent database record.
     if session_mgr.get(chat_id):
         await safe_send_message(
             ctx,
@@ -186,31 +165,56 @@ async def _launch_ai_quiz(
         )
         return ""
 
-    quiz_name = f"AI: {topic[:50]}"
+    quiz_name = (
+        quiz_name.strip()
+        if persist and quiz_name
+        else f"AI: {topic[:50]}"
+    )
+
+    if not quiz_name:
+        quiz_name = f"AI: {topic[:50]}"
+
     qid = f"AI{int(time.time())}{random.randint(100, 999)}"
 
-    # Save permanently when requested (PDF quiz sharing).
+    # Persist only when explicitly requested (PDF quiz workflow).
     if persist:
-        saved = await QuizRepository(get_db()).create(
-            creator_id=uid,
-            quiz_name=quiz_name,
-            questions=questions,
-            qid=qid,
-            sections=[],
-            timer=timer,
-            quiz_type="free",
-            negative_marks=neg,
-            correct_marks=cm,
-            shuffle_questions=shuffle_q,
-            shuffle_options=shuffle_o,
-            promo_message=None,
-        )
+        try:
+            saved = await QuizRepository(get_db()).create(
+                creator_id=uid,
+                quiz_name=quiz_name,
+                questions=questions,
+                qid=qid,
+                sections=[],
+                timer=timer,
+                quiz_type="free",
+                negative_marks=neg,
+                correct_marks=cm,
+                shuffle_questions=shuffle_q,
+                shuffle_options=shuffle_o,
+                promo_message=None,
+            )
 
-        if not saved:
+            if not saved:
+                await safe_send_message(
+                    ctx,
+                    chat_id,
+                    "❌ Quiz could not be saved to the database.",
+                )
+                return ""
+
+            qid = saved.get("qid", qid)
+
+        except Exception as e:
+            logger.error(
+                "PDF quiz save failed for user %s: %s",
+                uid,
+                e,
+                exc_info=True,
+            )
             await safe_send_message(
                 ctx,
                 chat_id,
-                "⚠️ Quiz could not be saved; share links were not created.",
+                "❌ Failed to save PDF quiz. Please try again.",
             )
             return ""
 
@@ -222,6 +226,7 @@ async def _launch_ai_quiz(
         "negative_marking": neg,
         "correct_mark": cm,
         "shuffle": shuffle_q,
+        "shuffle_questions": shuffle_q,
         "shuffle_options": shuffle_o,
         "shuffle_options_count": shuffle_o_count,
         "show_explanation": show_explanation,
@@ -231,7 +236,7 @@ async def _launch_ai_quiz(
         "creator_id": uid,
     }
 
-    # Private quiz.
+    # Private quiz
     if is_private:
         await start_private_quiz(
             chat_id,
@@ -240,10 +245,9 @@ async def _launch_ai_quiz(
             quiz_obj,
             qid,
         )
-        # Return qid so PDF handler can build share links.
-        return qid
+        return qid if persist else ""
 
-    # Group quiz.
+    # Group quiz
     if shuffle_q and not quiz_obj.get("sections"):
         random.shuffle(questions)
 
@@ -284,7 +288,7 @@ async def _launch_ai_quiz(
         name=f"quiz_{chat_id}_ai",
     )
 
-    return qid
+    return qid if persist else ""
 
 
 # ============================================================
@@ -310,7 +314,7 @@ async def aiquiz_command(
             await safe_send_message(
                 ctx,
                 chat_id,
-                "🤖 <b>AI Quiz Generator</b>\n\n"
+                "\U0001F916 <b>AI Quiz Generator</b>\n\n"
                 "Usage: <code>/aiquiz &lt;topic&gt;</code>\n"
                 "Example: <code>/aiquiz Indian History</code>\n\n"
                 "No DB storage — questions generated live, quiz starts immediately!\n"
@@ -335,7 +339,7 @@ async def aiquiz_command(
         msg = await safe_send_message(
             ctx,
             chat_id,
-            f"🤖 <b>AI Quiz: {topic}</b>\n\nHow many questions?",
+            f"\U0001F916 <b>AI Quiz: {topic}</b>\n\nHow many questions?",
             parse_mode=ParseMode.HTML,
             reply_markup=_kb("count", user_id),
         )
@@ -398,8 +402,8 @@ async def aiquiz_callback(
 
             await _edit(
                 msg,
-                f"🤖 <b>AI Quiz: {topic}</b>\n"
-                f"📋 Questions: {value}\n\nLanguage?",
+                f"\U0001F916 <b>AI Quiz: {topic}</b>\n"
+                f"\U0001F4CB Questions: {value}\n\nLanguage?",
                 _kb("lang", uid),
             )
 
@@ -409,9 +413,9 @@ async def aiquiz_callback(
 
             await _edit(
                 msg,
-                f"🤖 <b>AI Quiz: {topic}</b>\n"
-                f"📋 {sess['count']} | 🌐 {lbl}\n\n"
-                "🌐 <b>Bilingual mode?</b>\n"
+                f"\U0001F916 <b>AI Quiz: {topic}</b>\n"
+                f"\U0001F4CB {sess['count']} | \U0001F310 {lbl}\n\n"
+                "\U0001F310 <b>Bilingual mode?</b>\n"
                 "Show questions in 2 languages (lang1 / lang2 format)",
                 _kb("bilingual", uid),
             )
@@ -423,9 +427,9 @@ async def aiquiz_callback(
 
                 await _edit(
                     msg,
-                    f"🤖 <b>AI Quiz: {topic}</b>\n"
-                    f"📋 {sess['count']} | 🌐 {lbl} + ?\n\n"
-                    "🌐 <b>Select 2nd language:</b>",
+                    f"\U0001F916 <b>AI Quiz: {topic}</b>\n"
+                    f"\U0001F4CB {sess['count']} | \U0001F310 {lbl} + ?\n\n"
+                    "\U0001F310 <b>Select 2nd language:</b>",
                     _kb("lang2", uid),
                 )
             else:
@@ -435,8 +439,8 @@ async def aiquiz_callback(
 
                 await _edit(
                     msg,
-                    f"🤖 <b>AI Quiz: {topic}</b>\n"
-                    f"📋 {sess['count']} | 🌐 {lbl}\n\nDifficulty?",
+                    f"\U0001F916 <b>AI Quiz: {topic}</b>\n"
+                    f"\U0001F4CB {sess['count']} | \U0001F310 {lbl}\n\nDifficulty?",
                     _kb("diff", uid),
                 )
 
@@ -447,8 +451,8 @@ async def aiquiz_callback(
 
             await _edit(
                 msg,
-                f"🤖 <b>AI Quiz: {topic}</b>\n"
-                f"📋 {sess['count']} | 🌐 {l1} / {l2}\n\nDifficulty?",
+                f"\U0001F916 <b>AI Quiz: {topic}</b>\n"
+                f"\U0001F4CB {sess['count']} | \U0001F310 {l1} / {l2}\n\nDifficulty?",
                 _kb("diff", uid),
             )
 
@@ -456,15 +460,15 @@ async def aiquiz_callback(
             sess["diff"] = value
 
             dlbl = {
-                "moderate": "🟡 Moderate",
-                "hard": "🔴 Hard",
-                "extreme": "💀 Extreme",
+                "moderate": "\U0001F7E1 Moderate",
+                "hard": "\U0001F534 Hard",
+                "extreme": "\U0001F480 Extreme",
             }.get(value, value)
 
             await _edit(
                 msg,
-                f"🤖 <b>AI Quiz: {topic}</b>\n"
-                f"📋 {sess['count']} | {dlbl}\n\nExam style?",
+                f"\U0001F916 <b>AI Quiz: {topic}</b>\n"
+                f"\U0001F4CB {sess['count']} | {dlbl}\n\nExam style?",
                 _kb("exam", uid),
             )
 
@@ -472,9 +476,9 @@ async def aiquiz_callback(
             sess["exam"] = value
 
             elbl = {
-                "ssc": "📋 SSC",
-                "civil": "🏛 Civil",
-                "oneway": "📝 One Day",
+                "ssc": "\U0001F4CB SSC",
+                "civil": "\U0001F3DB Civil",
+                "oneway": "\U0001F4DD One Day",
             }.get(value, value)
 
             has_gemini = bool(await get_provider_keys(uid, "gemini"))
@@ -498,12 +502,12 @@ async def aiquiz_callback(
             if sess.get("bilingual") and sess.get("lang2"):
                 l1 = AIQUIZ_LANG_UI.get(sess.get("lang", "en"), "")
                 l2 = AIQUIZ_LANG_UI.get(sess["lang2"], "")
-                bilingual_info = f"\n🌐 <b>Bilingual:</b> {l1} / {l2}"
+                bilingual_info = f"\n\U0001F310 <b>Bilingual:</b> {l1} / {l2}"
 
             await _edit(
                 msg,
-                f"🤖 <b>AI Quiz: {topic}</b>\n"
-                f"📋 {sess['count']} | {elbl} | 🤖 {ai_label}"
+                f"\U0001F916 <b>AI Quiz: {topic}</b>\n"
+                f"\U0001F4CB {sess['count']} | {elbl} | \U0001F916 {ai_label}"
                 f"{bilingual_info}\n\n"
                 "⏳ Generating questions in chunks of 25...\n"
                 "This may take 30–120 seconds.",
@@ -538,7 +542,7 @@ async def aiquiz_callback(
 
             await _edit(
                 msg,
-                f"✅ Correct mark: +{value}\n\n🔀 <b>Shuffle?</b>",
+                f"✅ Correct mark: +{value}\n\n\U0001F500 <b>Shuffle?</b>",
                 _kb("shuffle", uid),
             )
 
@@ -556,8 +560,7 @@ async def aiquiz_callback(
             if sess["shuffle_o"]:
                 await _edit(
                     msg,
-                    f"✅ Shuffle: {slbl}\n\n"
-                    "🔀 <b>Shuffle how many options?</b>",
+                    f"✅ Shuffle: {slbl}\n\n\U0001F500 <b>Shuffle how many options?</b>",
                     _kb("shufflecount", uid),
                 )
             else:
@@ -565,8 +568,7 @@ async def aiquiz_callback(
 
                 await _edit(
                     msg,
-                    f"✅ Shuffle: {slbl}\n\n"
-                    "💡 Show explanation after each question?",
+                    f"✅ Shuffle: {slbl}\n\n\U0001F4A1 Show explanation after each question?",
                     InlineKeyboardMarkup([[
                         InlineKeyboardButton(
                             "✅ Yes",
@@ -589,7 +591,7 @@ async def aiquiz_callback(
             await _edit(
                 msg,
                 f"✅ Options shuffle range: {label}\n\n"
-                "💡 Show explanation after each question?",
+                "\U0001F4A1 Show explanation after each question?",
                 InlineKeyboardMarkup([[
                     InlineKeyboardButton(
                         "✅ Yes",
@@ -624,14 +626,14 @@ async def aiquiz_callback(
 
             await _edit(
                 msg,
-                f"🤖 <b>AI Quiz Ready!</b>\n\n"
-                f"📌 <b>Topic:</b> {topic}\n"
-                f"📋 <b>Questions:</b> {len(questions)}\n"
+                f"\U0001F916 <b>AI Quiz Ready!</b>\n\n"
+                f"\U0001F4CC <b>Topic:</b> {topic}\n"
+                f"\U0001F4CB <b>Questions:</b> {len(questions)}\n"
                 f"⏱ <b>Timer:</b> {sess['timer']}s\n"
                 f"✅ <b>Correct:</b> +{sess['cm']}\n"
                 f"➖ <b>Negative:</b> {neg_str}\n"
-                f"🔀 <b>Shuffle:</b> {slbl}\n"
-                f"💡 <b>Explanation:</b> "
+                f"\U0001F500 <b>Shuffle:</b> {slbl}\n"
+                f"\U0001F4A1 <b>Explanation:</b> "
                 f"{'✅ Yes' if sess['show_explanation'] else '❌ No'}\n\n"
                 "▶️ Starting quiz now...",
             )
@@ -719,11 +721,11 @@ async def _aiquiz_generate_flow(
         if lang2:
             l1 = AIQUIZ_LANG_UI.get(lang, lang)
             l2 = AIQUIZ_LANG_UI.get(lang2, lang2)
-            bilingual_tag = f"\n🌐 <b>Bilingual:</b> {l1} / {l2}"
+            bilingual_tag = f"\n\U0001F310 <b>Bilingual:</b> {l1} / {l2}"
 
         preview = (
             f"✅ <b>{got} questions generated!</b>{shortfall_note}\n\n"
-            f"📌 <b>Topic:</b> {topic}{bilingual_tag}\n"
+            f"\U0001F4CC <b>Topic:</b> {topic}{bilingual_tag}\n"
             "<b>Preview (first 3):</b>\n"
         )
 
@@ -752,12 +754,7 @@ async def _aiquiz_generate_flow(
 
     except Exception as e:
         logger.error("_aiquiz_generate_flow error: %s", e, exc_info=True)
-
-        await _edit(
-            msg,
-            f"❌ Generation error: {str(e)[:200]}",
-        )
-
+        await _edit(msg, f"❌ Generation error: {str(e)[:200]}")
         AI_QUIZ_SESSIONS.pop(uid, None)
 
 
