@@ -672,8 +672,8 @@ async def handle_creation_message(c: Client, m: Message) -> None:
             }
 
             ud["awaiting_default_text_confirm"] = True
-            ud["_dt'] = default_text
-            ud["_dtf'] = default_text_field
+            ud["_dt"] = default_text
+            ud["_dtf"] = default_text_field
 
             kb = InlineKeyboardMarkup(
                 [
