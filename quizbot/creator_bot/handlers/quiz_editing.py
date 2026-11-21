@@ -604,12 +604,17 @@ async def handle_edit_text_input(c: Client, m: Message) -> None:
         await m.reply(f"⚠️ Error: {exc}")
 
 
+
 def register(app: Client) -> None:
     app.on_message(filters.command("edit") & filters.private)(edit_cmd)
     app.on_message(filters.command("stopedit") & filters.private)(stopedit_cmd)
-        app.on_callback_query(
+
+    app.on_callback_query(
         filters.regex(
             r"^(?!stg_|dtc_|plan_|pay_|buy_|qd_|srch_|bat_|prev:|next:|refresh:|myq_)"
         )
     )(edit_tree_cb)
-    app.on_message(filters.text & filters.private & in_edit_session_filter())(handle_edit_text_input)
+
+    app.on_message(
+        filters.text & filters.private & in_edit_session_filter()
+    )(handle_edit_text_input)
