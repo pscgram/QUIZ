@@ -1238,8 +1238,7 @@ async def start_quiz(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 parse_mode=ParseMode.HTML, reply_markup=btn,
             )
             return
-
-                user_id = update.message.from_user.id
+        user_id = update.message.from_user.id
 
         # Allow users to open shared quiz links without premium.
 
