@@ -198,7 +198,12 @@ async def _finalize_quiz(
     settings_repo = CreatorSettingsRepository(get_db())
     settings = await settings_repo.get(uid)
 
-    default_text = settings.get("default_text")
+    # Respect the user's choice to skip default text.
+    default_text = (
+        None
+        if state.quiz_creation[uid].get("_skip_default_text")
+        else settings.get("default_text")
+    )
     default_text_field = settings.get("default_text_field", "both")
 
     if default_text:
@@ -781,12 +786,14 @@ async def default_text_confirm_cb(c: Client, cb: CallbackQuery) -> None:
         return
 
     ud = state.quiz_creation[uid]
-
     ud.pop("awaiting_default_text_confirm", None)
 
     if action == "no":
         ud.pop("_dt", None)
         ud.pop("_dtf", None)
+        ud["_skip_default_text"] = True
+    else:
+        ud["_skip_default_text"] = False
 
     ud["awaiting_type"] = True
 
