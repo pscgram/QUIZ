@@ -80,7 +80,6 @@ async def pdfquiz_command(
 
         if update.message.reply_to_message:
             replied = update.message.reply_to_message.document
-
             if replied and replied.mime_type == "application/pdf":
                 doc = replied
 
@@ -92,7 +91,8 @@ async def pdfquiz_command(
                 "Reply to a PDF file with:\n\n"
                 "• <code>/pdfquiz</code> — select pages interactively\n"
                 "• <code>/pdfquiz 1-10</code> — select pages 1 to 10\n"
-                "• <code>/pdfquiz all</code> — select up to 20 pages\n\n"
+                "• <code>/pdfquiz all</code> — all pages of the PDF\n\n"
+                "🎯 Generate up to 100 questions.\n"
                 "⚠️ Requires a Gemini API key.",
                 parse_mode=ParseMode.HTML,
             )
@@ -114,6 +114,14 @@ async def pdfquiz_command(
 
         total_pages = await _count_pdf_pages(pdf_path)
 
+        if total_pages <= 0:
+            await sm.edit_text(
+                "❌ Could not read the PDF page count.\n"
+                "Please ensure PyMuPDF is installed and try again."
+            )
+            await remove_file(pdf_path)
+            return
+
         PDF_QUIZ_SESSIONS[user_id] = {
             "pdf_path": pdf_path,
             "gemini_key": gemini_key,
@@ -124,7 +132,7 @@ async def pdfquiz_command(
             "user_id": user_id,
         }
 
-        page_info = f" ({total_pages} pages)" if total_pages else ""
+        page_info = f" ({total_pages} pages)"
         inline_range = " ".join(ctx.args).strip().lower() if ctx.args else ""
 
         if inline_range:
@@ -160,16 +168,16 @@ async def pdfquiz_command(
             "Send the page range to generate questions from:\n\n"
             "• <code>1-5</code> — pages 1 to 5\n"
             "• <code>3-10</code> — pages 3 to 10\n"
-            "• <code>all</code> — all pages (maximum 20)\n\n"
+            "• <code>all</code> — all pages of this PDF\n\n"
             "<i>Tip: You can also use "
             "<code>/pdfquiz 1-10</code></i>\n\n"
+            "🎯 Up to 100 questions can be generated.\n"
             "🔍 Pages will be processed individually.",
             parse_mode=ParseMode.HTML,
         )
 
     except Exception as e:
         logger.error("pdfquiz_command error: %s", e, exc_info=True)
-
         try:
             await safe_send_message(ctx, chat_id, f"❌ Error: {str(e)[:200]}")
         except Exception:
@@ -177,16 +185,16 @@ async def pdfquiz_command(
 
 
 # ============================================================
-# PAGE RANGE
+# PAGE RANGE — NO 20-PAGE LIMIT
 # ============================================================
 
 def _parse_range(text: str, total_pages: int) -> tuple[int, int]:
     text = text.strip().lower()
 
     if text == "all":
-        if total_pages:
-            return 1, min(20, total_pages)
-        return 1, 20
+        if total_pages <= 0:
+            raise ValueError("Unable to determine PDF page count")
+        return 1, total_pages
 
     parts = text.split("-")
 
@@ -199,40 +207,32 @@ def _parse_range(text: str, total_pages: int) -> tuple[int, int]:
     if start_p < 1 or end_p < start_p:
         raise ValueError("Invalid page range")
 
-    if total_pages and start_p > total_pages:
+    if total_pages and (start_p > total_pages or end_p > total_pages):
         raise ValueError("Page out of bounds")
 
-    if total_pages:
-        end_p = min(end_p, total_pages)
-
-    end_p = min(end_p, start_p + 19)
-
+    # The previous 20-page selection limit has been removed.
     return start_p, end_p
 
 
 # ============================================================
-# QUESTION COUNT BUTTONS
+# QUESTION COUNT BUTTONS — UP TO 100
 # ============================================================
 
 def _count_kb(user_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
+    numbers = (5, 10, 15, 20, 25, 30, 40, 50, 75, 100)
+
+    rows = [
         [
-            [
-                InlineKeyboardButton(
-                    str(n),
-                    callback_data=f"pdfq_count_{user_id}_{n}",
-                )
-                for n in (5, 10, 15, 20)
-            ],
-            [
-                InlineKeyboardButton(
-                    str(n),
-                    callback_data=f"pdfq_count_{user_id}_{n}",
-                )
-                for n in (25, 30, 40, 50)
-            ],
+            InlineKeyboardButton(
+                str(n),
+                callback_data=f"pdfq_count_{user_id}_{n}",
+            )
+            for n in numbers[i:i + 4]
         ]
-    )
+        for i in range(0, len(numbers), 4)
+    ]
+
+    return InlineKeyboardMarkup(rows)
 
 
 # ============================================================
@@ -273,42 +273,42 @@ def _review_kb(
         else "⏭ Skip this question"
     )
 
-    buttons = [
+    return InlineKeyboardMarkup(
         [
-            InlineKeyboardButton(
-                "✏️ Edit Question / Options",
-                callback_data=f"pdfq_ed_{uid}_menu",
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "⏮ Previous",
-                callback_data=f"pdfq_rv_{uid}_prev",
-            ),
-            InlineKeyboardButton(
-                "Next ⏭",
-                callback_data=f"pdfq_rv_{uid}_next",
-            ),
-        ],
-        [
-            InlineKeyboardButton(
-                skip_label,
-                callback_data=f"pdfq_rv_{uid}_toggle",
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "✅ Approve & Create Quiz",
-                callback_data=f"pdfq_rv_{uid}_finish",
-            )
-        ],
-    ]
-
-    return InlineKeyboardMarkup(buttons)
+            [
+                InlineKeyboardButton(
+                    "✏️ Edit Question / Options",
+                    callback_data=f"pdfq_ed_{uid}_menu",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "⏮ Previous",
+                    callback_data=f"pdfq_rv_{uid}_prev",
+                ),
+                InlineKeyboardButton(
+                    "Next ⏭",
+                    callback_data=f"pdfq_rv_{uid}_next",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    skip_label,
+                    callback_data=f"pdfq_rv_{uid}_toggle",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "✅ Approve & Create Quiz",
+                    callback_data=f"pdfq_rv_{uid}_finish",
+                )
+            ],
+        ]
+    )
 
 
 # ============================================================
-# EDIT MENU KEYBOARD
+# EDIT MENU
 # ============================================================
 
 def _edit_menu_kb(uid: int, question: dict) -> InlineKeyboardMarkup:
@@ -324,39 +324,45 @@ def _edit_menu_kb(uid: int, question: dict) -> InlineKeyboardMarkup:
     ]
 
     for i, option in enumerate(options):
-        buttons.append([
-            InlineKeyboardButton(
-                f"✏️ Edit Option {i + 1}",
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    f"✏️ Edit Option {i + 1}",
                 callback_data=f"pdfq_ed_{uid}_opt_{i}",
-            ),
-            InlineKeyboardButton(
-                f"🗑 Remove {i + 1}",
-                callback_data=f"pdfq_ed_{uid}_del_{i}",
-            ),
-        ])
+                ),
+                InlineKeyboardButton(
+                    f"🗑 Remove {i + 1}",
+                    callback_data=f"pdfq_ed_{uid}_del_{i}",
+                ),
+            ]
+        )
 
     if len(options) < 10:
-        buttons.append([
-            InlineKeyboardButton(
-                "➕ Add New Option",
-                callback_data=f"pdfq_ed_{uid}_add",
-            )
-        ])
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    "➕ Add New Option",
+                    callback_data=f"pdfq_ed_{uid}_add",
+                )
+            ]
+        )
 
-    buttons.extend([
+    buttons.extend(
         [
-            InlineKeyboardButton(
-                "✅ Change Correct Answer",
-                callback_data=f"pdfq_ed_{uid}_answer",
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "↩️ Back to Review",
-                callback_data=f"pdfq_ed_{uid}_back",
-            )
-        ],
-    ])
+            [
+                InlineKeyboardButton(
+                    "✅ Change Correct Answer",
+                    callback_data=f"pdfq_ed_{uid}_answer",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "↩️ Back to Review",
+                    callback_data=f"pdfq_ed_{uid}_back",
+                )
+            ],
+        ]
+    )
 
     return InlineKeyboardMarkup(buttons)
 
@@ -406,7 +412,7 @@ def _review_text(sess: dict, index: int) -> str:
 
 
 # ============================================================
-# REFRESH REVIEW MESSAGE
+# RESTORE REVIEW MESSAGE
 # ============================================================
 
 async def _show_review_again(
@@ -414,19 +420,15 @@ async def _show_review_again(
     uid: int,
     sess: dict,
 ) -> None:
-    """Restore the review screen after an edit."""
-
     questions = sess.get("questions", [])
+
     if not questions:
         return
 
-    index = sess.get("review_index", 0)
-    index = max(0, min(index, len(questions) - 1))
-
+    index = max(0, min(sess.get("review_index", 0), len(questions) - 1))
     chat_id = sess.get("review_chat_id", sess.get("chat_id", uid))
     message_id = sess.get("review_message_id")
 
-    text = _review_text(sess, index)
     markup = _review_kb(
         uid,
         index,
@@ -439,7 +441,7 @@ async def _show_review_again(
             await ctx.bot.edit_message_text(
                 chat_id=chat_id,
                 message_id=message_id,
-                text=text,
+                text=_review_text(sess, index),
                 parse_mode=ParseMode.HTML,
                 reply_markup=markup,
             )
@@ -450,7 +452,7 @@ async def _show_review_again(
     sent = await safe_send_message(
         ctx,
         chat_id,
-        text,
+        _review_text(sess, index),
         parse_mode=ParseMode.HTML,
         reply_markup=markup,
     )
@@ -468,8 +470,6 @@ async def pdfquiz_message_handler(
     update: Update,
     ctx: ContextTypes.DEFAULT_TYPE,
 ) -> bool:
-    """Handle page range, edit inputs and quiz-name text."""
-
     try:
         if not update.message or not update.message.text:
             return False
@@ -481,11 +481,11 @@ async def pdfquiz_message_handler(
         if not sess:
             return False
 
-        # ----------------------------------------------------
-        # QUESTION EDIT INPUTS
-        # ----------------------------------------------------
-
         edit_step = sess.get("step")
+
+        # ----------------------------------------------------
+        # EDIT INPUTS
+        # ----------------------------------------------------
 
         if edit_step in {
             "edit_question",
@@ -507,12 +507,10 @@ async def pdfquiz_message_handler(
             if edit_step == "edit_question":
                 if not value:
                     await safe_send_message(
-                        ctx,
-                        chat_id,
-                        "❌ Question cannot be empty. Send the corrected question:",
+                        ctx, chat_id,
+                        "❌ Question cannot be empty. Send it again:",
                     )
                     return True
-
                 q["question"] = value
 
             elif edit_step == "edit_option":
@@ -520,16 +518,12 @@ async def pdfquiz_message_handler(
 
                 if not (0 <= option_index < len(options)):
                     sess["step"] = "review"
-                    await safe_send_message(
-                        ctx, chat_id, "❌ Invalid option. Please try again."
-                    )
                     return True
 
                 if not value:
                     await safe_send_message(
-                        ctx,
-                        chat_id,
-                        "❌ Option cannot be empty. Send the corrected option:",
+                        ctx, chat_id,
+                        "❌ Option cannot be empty. Send it again:",
                     )
                     return True
 
@@ -538,15 +532,15 @@ async def pdfquiz_message_handler(
             elif edit_step == "edit_add_option":
                 if not value:
                     await safe_send_message(
-                        ctx,
-                        chat_id,
-                        "❌ Option cannot be empty. Send the option again:",
+                        ctx, chat_id,
+                        "❌ Option cannot be empty. Send it again:",
                     )
                     return True
 
                 if len(options) >= 10:
                     await safe_send_message(
-                        ctx, chat_id, "❌ Maximum 10 options are allowed."
+                        ctx, chat_id,
+                        "❌ Maximum 10 options allowed.",
                     )
                     return True
 
@@ -554,10 +548,12 @@ async def pdfquiz_message_handler(
 
             elif edit_step == "edit_answer":
                 try:
-                    answer_ids = sorted({
-                        int(part.strip()) - 1
-                        for part in value.split(",")
-                    })
+                    answer_ids = sorted(
+                        {
+                            int(part.strip()) - 1
+                            for part in value.split(",")
+                        }
+                    )
 
                     if (
                         not answer_ids
@@ -575,9 +571,8 @@ async def pdfquiz_message_handler(
                         ctx,
                         chat_id,
                         "❌ Invalid answer number.\n\n"
-                        "Send the correct option number.\n"
                         "Example: <code>2</code>\n"
-                        "For multiple correct answers: <code>2,4</code>",
+                        "Multiple answers: <code>2,4</code>",
                         parse_mode=ParseMode.HTML,
                     )
                     return True
@@ -587,11 +582,7 @@ async def pdfquiz_message_handler(
 
             await _show_review_again(ctx, user_id, sess)
 
-            await safe_send_message(
-                ctx,
-                chat_id,
-                "✅ Changes saved successfully.",
-            )
+            await safe_send_message(ctx, chat_id, "✅ Changes saved.")
             return True
 
         # ----------------------------------------------------
@@ -609,7 +600,8 @@ async def pdfquiz_message_handler(
                 await safe_send_message(
                     ctx,
                     chat_id,
-                    "❌ Invalid format. Send <code>1-10</code> or <code>all</code>.",
+                    "❌ Invalid page range.\n"
+                    "Send <code>1-10</code> or <code>all</code>.",
                     parse_mode=ParseMode.HTML,
                 )
                 return True
@@ -638,17 +630,15 @@ async def pdfquiz_message_handler(
 
             if not quiz_name:
                 await safe_send_message(
-                    ctx,
-                    chat_id,
+                    ctx, chat_id,
                     "❌ Quiz name cannot be empty. Send a quiz name:",
                 )
                 return True
 
             if len(quiz_name) > 80:
                 await safe_send_message(
-                    ctx,
-                    chat_id,
-                    "❌ Quiz name must be 80 characters or fewer. Try again:",
+                    ctx, chat_id,
+                    "❌ Quiz name must be 80 characters or fewer.",
                 )
                 return True
 
@@ -741,7 +731,6 @@ async def pdfquiz_text_gate(
     update: Update,
     ctx: ContextTypes.DEFAULT_TYPE,
 ) -> None:
-    """Ignore text outside an active PDF quiz setup flow."""
     await pdfquiz_message_handler(update, ctx)
 
 
@@ -753,11 +742,8 @@ async def pdfquiz_callback(
     update: Update,
     ctx: ContextTypes.DEFAULT_TYPE,
 ) -> None:
-    """Handle PDF quiz callbacks."""
-
     try:
         query = update.callback_query
-
         if not query:
             return
 
@@ -815,43 +801,34 @@ async def pdfquiz_callback(
             sess["review_message_id"] = msg.message_id
             sess["review_chat_id"] = msg.chat_id
 
-            # EDIT MENU
             if value == "menu":
                 sess["step"] = "review"
 
                 await msg.edit_text(
                     "✏️ <b>EDIT QUESTION</b>\n\n"
-                    "Choose what you want to change.\n"
-                    "You can edit the question, individual options, "
-                    "or the correct answer.",
+                    "Choose what you want to change.",
                     parse_mode=ParseMode.HTML,
                     reply_markup=_edit_menu_kb(uid, q),
                 )
                 return
 
-            # BACK TO REVIEW
             if value == "back":
                 sess["step"] = "review"
                 await msg.edit_text(
                     _review_text(sess, index),
                     parse_mode=ParseMode.HTML,
                     reply_markup=_review_kb(
-                        uid,
-                        index,
-                        len(questions),
+                        uid, index, len(questions),
                         sess.setdefault("skipped", set()),
                     ),
                 )
                 return
 
-            # EDIT QUESTION TEXT
             if value == "question":
                 sess["step"] = "edit_question"
-
                 await msg.edit_text(
                     "📝 <b>EDIT QUESTION TEXT</b>\n\n"
-                    "Send the corrected question text.\n\n"
-                    "Malayalam and other languages are supported.\n"
+                    "Send the corrected question.\n"
                     "Your text will be saved exactly as you send it.",
                     parse_mode=ParseMode.HTML,
                     reply_markup=InlineKeyboardMarkup([[
@@ -863,7 +840,6 @@ async def pdfquiz_callback(
                 )
                 return
 
-            # EDIT AN INDIVIDUAL OPTION
             if value and value.startswith("opt_"):
                 try:
                     option_index = int(value.split("_", 1)[1])
@@ -881,7 +857,7 @@ async def pdfquiz_callback(
                     f"✏️ <b>EDIT OPTION {option_index + 1}</b>\n\n"
                     f"Current option:\n"
                     f"<code>{escape(str(options[option_index]))}</code>\n\n"
-                    "Send the replacement option text.",
+                    "Send the replacement text.",
                     parse_mode=ParseMode.HTML,
                     reply_markup=InlineKeyboardMarkup([[
                         InlineKeyboardButton(
@@ -892,17 +868,14 @@ async def pdfquiz_callback(
                 )
                 return
 
-            # ADD AN OPTION
             if value == "add":
                 if len(options) >= 10:
                     await query.answer(
-                        "Maximum 10 options are allowed.",
-                        show_alert=True,
+                        "Maximum 10 options allowed.", show_alert=True
                     )
                     return
 
                 sess["step"] = "edit_add_option"
-
                 await msg.edit_text(
                     "➕ <b>ADD NEW OPTION</b>\n\n"
                     "Send the new option text.",
@@ -916,7 +889,6 @@ async def pdfquiz_callback(
                 )
                 return
 
-            # REMOVE AN OPTION
             if value and value.startswith("del_"):
                 try:
                     option_index = int(value.split("_", 1)[1])
@@ -929,14 +901,13 @@ async def pdfquiz_callback(
 
                 if len(options) <= 2:
                     await query.answer(
-                        "At least 2 options must remain.",
-                        show_alert=True,
+                        "At least 2 options must remain.", show_alert=True
                     )
                     return
 
                 removed_option = options.pop(option_index)
-
                 old_correct = q.get("correct_option_id", [])
+
                 if not isinstance(old_correct, list):
                     old_correct = [old_correct]
 
@@ -945,13 +916,10 @@ async def pdfquiz_callback(
                 for correct_id in old_correct:
                     if not isinstance(correct_id, int):
                         continue
-
                     if correct_id == option_index:
                         continue
-
                     if correct_id > option_index:
                         correct_id -= 1
-
                     new_correct.append(correct_id)
 
                 q["correct_option_id"] = new_correct
@@ -963,9 +931,7 @@ async def pdfquiz_callback(
                     + _review_text(sess, index),
                     parse_mode=ParseMode.HTML,
                     reply_markup=_review_kb(
-                        uid,
-                        index,
-                        len(questions),
+                        uid, index, len(questions),
                         sess.setdefault("skipped", set()),
                     ),
                 )
@@ -974,13 +940,11 @@ async def pdfquiz_callback(
                     await safe_send_message(
                         ctx,
                         msg.chat_id,
-                        "⚠️ The removed option was marked as correct.\n"
-                        "Please use Edit Question / Options → "
-                        "Change Correct Answer to select the new answer.",
+                        "⚠️ The removed option was marked correct.\n"
+                        "Use Edit Question / Options → Change Correct Answer.",
                     )
                 return
 
-            # CHANGE CORRECT ANSWER
             if value == "answer":
                 sess["step"] = "edit_answer"
 
@@ -993,9 +957,8 @@ async def pdfquiz_callback(
                     "✅ <b>CHANGE CORRECT ANSWER</b>\n\n"
                     f"{option_lines}\n\n"
                     "Send the correct option number.\n"
-                    "Example: <code>2</code>\n\n"
-                    "For multiple correct answers, use commas:\n"
-                    "<code>2,4</code>",
+                    "Example: <code>2</code>\n"
+                    "Multiple answers: <code>2,4</code>",
                     parse_mode=ParseMode.HTML,
                     reply_markup=InlineKeyboardMarkup([[
                         InlineKeyboardButton(
@@ -1016,7 +979,7 @@ async def pdfquiz_callback(
             questions = sess.get("questions", [])
 
             if not questions:
-                await msg.edit_text("❌ No questions available to review.")
+                await msg.edit_text("❌ No questions available.")
                 return
 
             skipped = sess.setdefault("skipped", set())
@@ -1047,12 +1010,11 @@ async def pdfquiz_callback(
                     )
                     return
 
-                # Do not include skipped questions.
                 sess["questions"] = approved
                 sess["step"] = "title"
 
                 await msg.edit_text(
-                    f"✅ Review approved!\n"
+                    "✅ Review approved!\n"
                     f"Questions kept: {len(approved)}\n"
                     f"Questions skipped: {len(skipped)}\n\n"
                     "📝 <b>Send a name for this quiz.</b>\n\n"
@@ -1071,16 +1033,13 @@ async def pdfquiz_callback(
                 _review_text(sess, index),
                 parse_mode=ParseMode.HTML,
                 reply_markup=_review_kb(
-                    uid,
-                    index,
-                    len(questions),
-                    skipped,
+                    uid, index, len(questions), skipped
                 ),
             )
             return
 
         # ----------------------------------------------------
-        # QUESTION COUNT — START GENERATION
+        # QUESTION COUNT — GENERATION
         # ----------------------------------------------------
 
         if step == "count":
@@ -1090,13 +1049,12 @@ async def pdfquiz_callback(
                 await query.answer("Invalid question count.", show_alert=True)
                 return
 
-            if count not in (5, 10, 15, 20, 25, 30, 40, 50):
+            if count not in (5, 10, 15, 20, 25, 30, 40, 50, 75, 100):
                 await query.answer("Invalid question count.", show_alert=True)
                 return
 
             sess["count"] = count
 
-            # PDF quiz defaults
             sess["diff"] = "moderate"
             sess["exam"] = "oneway"
             sess["lang"] = "auto"
@@ -1108,15 +1066,13 @@ async def pdfquiz_callback(
             sess["shuffle_o_count"] = 0
             sess["show_explanation"] = True
 
-            pages_count = (
-                sess["page_end"] - sess["page_start"] + 1
-            )
+            pages_count = sess["page_end"] - sess["page_start"] + 1
 
             await msg.edit_text(
                 "📄 <b>Starting PDF extraction...</b>\n\n"
                 f"📄 Pages: {sess['page_start']}–{sess['page_end']} "
-                f"({pages_count} pages)\n"
-                f"🎯 Target: {sess['count']} questions\n\n"
+                f"({pages_count} page(s))\n"
+                f"🎯 Target: <b>{sess['count']} questions</b>\n\n"
                 "🔍 Processing pages individually.\n"
                 "⏳ Please wait...",
                 parse_mode=ParseMode.HTML,
@@ -1144,7 +1100,7 @@ async def _pdfquiz_generate_flow(
     msg: Any,
     sess: dict,
 ) -> None:
-    """Process selected PDF pages and send questions to review."""
+    """Process every selected PDF page until target questions are collected."""
 
     pdf_path = sess["pdf_path"]
     start_p = sess["page_start"]
@@ -1160,7 +1116,7 @@ async def _pdfquiz_generate_flow(
     except ImportError:
         await msg.edit_text(
             "❌ PyMuPDF is not installed.\n"
-            "Admin must install: <code>pip install PyMuPDF</code>",
+            "Install: <code>pip install PyMuPDF</code>",
             parse_mode=ParseMode.HTML,
         )
         PDF_QUIZ_SESSIONS.pop(uid, None)
@@ -1175,13 +1131,8 @@ async def _pdfquiz_generate_flow(
 
     def _extract_page_bytes(doc, page_idx: int) -> bytes:
         one_page = fitz.open()
-
         try:
-            one_page.insert_pdf(
-                doc,
-                from_page=page_idx,
-                to_page=page_idx,
-            )
+            one_page.insert_pdf(doc, from_page=page_idx, to_page=page_idx)
             return one_page.tobytes()
         finally:
             one_page.close()
@@ -1192,7 +1143,7 @@ async def _pdfquiz_generate_flow(
         actual_end = min(end_p, src_doc.page_count)
         total_pages_in_range = actual_end - start_p + 1
 
-        if total_pages_in_range <= 0:
+        if start_p < 1 or actual_end < start_p:
             await msg.edit_text("❌ Invalid page range.")
             PDF_QUIZ_SESSIONS.pop(uid, None)
             await remove_file(pdf_path)
@@ -1203,8 +1154,9 @@ async def _pdfquiz_generate_flow(
         for page_idx in range(start_p - 1, actual_end):
             page_num = page_idx + 1
             pages_remaining = actual_end - page_idx
-            questions_remaining = total_q - len(all_questions)
+            questions_remaining = total_q - len(all_questions
 
+)
             if questions_remaining <= 0:
                 break
 
@@ -1227,12 +1179,8 @@ async def _pdfquiz_generate_flow(
                 pass
 
             page_bytes = await loop.run_in_executor(
-                None,
-                _extract_page_bytes,
-                src_doc,
-                page_idx,
+                None, _extract_page_bytes, src_doc, page_idx
             )
-
             page_b64 = base64.b64encode(page_bytes).decode("utf-8")
 
             try:
@@ -1261,8 +1209,7 @@ async def _pdfquiz_generate_flow(
         if not all_questions:
             await msg.edit_text(
                 "❌ No questions generated.\n\n"
-                "The PDF may be empty or unreadable. "
-                "Try a different page range."
+                "The PDF may be empty or unreadable. Try another page range."
             )
             PDF_QUIZ_SESSIONS.pop(uid, None)
             await remove_file(pdf_path)
@@ -1270,7 +1217,6 @@ async def _pdfquiz_generate_flow(
 
         all_questions = all_questions[:total_q]
 
-        # START REVIEW — QUIZ NOT CREATED YET
         sess["questions"] = all_questions
         sess["skipped"] = set()
         sess["review_index"] = 0
@@ -1285,10 +1231,7 @@ async def _pdfquiz_generate_flow(
             _review_text(sess, 0),
             parse_mode=ParseMode.HTML,
             reply_markup=_review_kb(
-                uid,
-                0,
-                len(all_questions),
-                sess["skipped"],
+                uid, 0, len(all_questions), sess["skipped"]
             ),
         )
 
@@ -1298,7 +1241,6 @@ async def _pdfquiz_generate_flow(
             e,
             exc_info=True,
         )
-
         try:
             await msg.edit_text(
                 f"❌ Generation error: {escape(str(e)[:300])}",
@@ -1306,7 +1248,6 @@ async def _pdfquiz_generate_flow(
             )
         except Exception:
             pass
-
         PDF_QUIZ_SESSIONS.pop(uid, None)
 
     finally:
