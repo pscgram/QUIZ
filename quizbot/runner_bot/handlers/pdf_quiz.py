@@ -12,6 +12,7 @@ import base64
 import logging
 import os
 import time
+import re
 from html import escape
 from typing import Any
 
@@ -185,7 +186,7 @@ async def pdfquiz_command(
 
 
 # ============================================================
-# PAGE RANGE — NO 20-PAGE LIMIT
+# PAGE RANGE
 # ============================================================
 
 def _parse_range(text: str, total_pages: int) -> tuple[int, int]:
@@ -210,12 +211,11 @@ def _parse_range(text: str, total_pages: int) -> tuple[int, int]:
     if total_pages and (start_p > total_pages or end_p > total_pages):
         raise ValueError("Page out of bounds")
 
-    # The previous 20-page selection limit has been removed.
     return start_p, end_p
 
 
 # ============================================================
-# QUESTION COUNT BUTTONS — UP TO 100
+# QUESTION COUNT BUTTONS
 # ============================================================
 
 def _count_kb(user_id: int) -> InlineKeyboardMarkup:
@@ -328,7 +328,7 @@ def _edit_menu_kb(uid: int, question: dict) -> InlineKeyboardMarkup:
             [
                 InlineKeyboardButton(
                     f"✏️ Edit Option {i + 1}",
-                callback_data=f"pdfq_ed_{uid}_opt_{i}",
+                    callback_data=f"pdfq_ed_{uid}_opt_{i}",
                 ),
                 InlineKeyboardButton(
                     f"🗑 Remove {i + 1}",
@@ -483,10 +483,6 @@ async def pdfquiz_message_handler(
 
         edit_step = sess.get("step")
 
-        # ----------------------------------------------------
-        # EDIT INPUTS
-        # ----------------------------------------------------
-
         if edit_step in {
             "edit_question",
             "edit_option",
@@ -581,13 +577,8 @@ async def pdfquiz_message_handler(
             sess.pop("editing_option_index", None)
 
             await _show_review_again(ctx, user_id, sess)
-
             await safe_send_message(ctx, chat_id, "✅ Changes saved.")
             return True
-
-        # ----------------------------------------------------
-        # PAGE RANGE
-        # ----------------------------------------------------
 
         if sess.get("step") == "pages":
             text = update.message.text.strip().lower()
@@ -620,10 +611,6 @@ async def pdfquiz_message_handler(
                 reply_markup=_count_kb(user_id),
             )
             return True
-
-        # ----------------------------------------------------
-        # QUIZ NAME
-        # ----------------------------------------------------
 
         if sess.get("step") == "title":
             quiz_name = update.message.text.strip()
@@ -783,10 +770,6 @@ async def pdfquiz_callback(
         await query.answer()
         msg = query.message
 
-        # ----------------------------------------------------
-        # EDIT QUESTION / OPTIONS
-        # ----------------------------------------------------
-
         if step == "ed":
             questions = sess.get("questions", [])
             index = sess.get("review_index", 0)
@@ -803,7 +786,6 @@ async def pdfquiz_callback(
 
             if value == "menu":
                 sess["step"] = "review"
-
                 await msg.edit_text(
                     "✏️ <b>EDIT QUESTION</b>\n\n"
                     "Choose what you want to change.",
@@ -971,10 +953,6 @@ async def pdfquiz_callback(
 
             return
 
-        # ----------------------------------------------------
-        # QUESTION REVIEW
-        # ----------------------------------------------------
-
         if step == "rv":
             questions = sess.get("questions", [])
 
@@ -1038,10 +1016,6 @@ async def pdfquiz_callback(
             )
             return
 
-        # ----------------------------------------------------
-        # QUESTION COUNT — GENERATION
-        # ----------------------------------------------------
-
         if step == "count":
             try:
                 count = int(value)
@@ -1054,7 +1028,6 @@ async def pdfquiz_callback(
                 return
 
             sess["count"] = count
-
             sess["diff"] = "moderate"
             sess["exam"] = "oneway"
             sess["lang"] = "auto"
@@ -1091,7 +1064,95 @@ async def pdfquiz_callback(
 
 
 # ============================================================
-# PDF QUESTION GENERATION FLOW
+# QUESTION DEDUPLICATION
+# ============================================================
+
+def _normalise_for_duplicate(value: Any) -> str:
+    """
+    Normalise text only for duplicate comparison.
+    The original question and option text are never modified.
+    """
+    text = str(value or "").casefold()
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+def _question_fingerprint(question: dict) -> tuple:
+    """
+    Create a comparison key from the question and its options.
+    Original question data remains untouched.
+    """
+    question_text = _normalise_for_duplicate(
+        question.get("question", "")
+    )
+
+    options = question.get("options", [])
+
+    if not isinstance(options, list):
+        options = []
+
+    normalised_options = tuple(
+        _normalise_for_duplicate(option)
+        for option in options
+    )
+
+    return question_text, normalised_options
+
+
+def _add_unique_questions(
+    destination: list[dict],
+    incoming: Any,
+    fingerprints: set,
+) -> int:
+    """Add valid, non-duplicate question dictionaries."""
+
+    if not isinstance(incoming, list):
+        return 0
+
+    added = 0
+
+    for question in incoming:
+        if not isinstance(question, dict):
+            continue
+
+        question_text = question.get("question")
+        options = question.get("options")
+        correct = question.get("correct_option_id")
+
+        if not isinstance(question_text, str) or not question_text.strip():
+            continue
+
+        if not isinstance(options, list) or len(options) < 2:
+            continue
+
+        if not isinstance(correct, list):
+            correct = [correct] if correct is not None else []
+
+        valid_correct = []
+
+        for item in correct:
+            if isinstance(item, int) and 0 <= item < len(options):
+                valid_correct.append(item)
+
+        if not valid_correct:
+            continue
+
+        fingerprint = _question_fingerprint(question)
+
+        if fingerprint in fingerprints:
+            continue
+
+        fingerprints.add(fingerprint)
+
+        # Preserve the returned question and option text.
+        destination.append(question)
+        added += 1
+
+    return added
+
+
+# ============================================================
+# PDF QUESTION GENERATION FLOW — RETRY + DEDUPLICATION
 # ============================================================
 
 async def _pdfquiz_generate_flow(
@@ -1100,7 +1161,18 @@ async def _pdfquiz_generate_flow(
     msg: Any,
     sess: dict,
 ) -> None:
-    """Process every selected PDF page until target questions are collected."""
+    """
+    Extract questions from selected PDF pages.
+
+    Pass 1:
+        Process every selected page.
+
+    Recovery:
+        Retry pages that produced fewer questions than expected.
+        Retry at most twice per page.
+
+    Duplicate questions are filtered before they enter the review.
+    """
 
     pdf_path = sess["pdf_path"]
     start_p = sess["page_start"]
@@ -1110,6 +1182,9 @@ async def _pdfquiz_generate_flow(
     exam = sess["exam"]
     lang = sess["lang"]
     gemini_key = sess["gemini_key"]
+
+    MAX_ATTEMPTS_PER_PAGE = 3
+    RETRY_DELAY_SECONDS = 1.0
 
     try:
         import fitz
@@ -1132,7 +1207,11 @@ async def _pdfquiz_generate_flow(
     def _extract_page_bytes(doc, page_idx: int) -> bytes:
         one_page = fitz.open()
         try:
-            one_page.insert_pdf(doc, from_page=page_idx, to_page=page_idx)
+            one_page.insert_pdf(
+                doc,
+                from_page=page_idx,
+                to_page=page_idx,
+            )
             return one_page.tobytes()
         finally:
             one_page.close()
@@ -1141,50 +1220,60 @@ async def _pdfquiz_generate_flow(
         src_doc = await loop.run_in_executor(None, _open_doc)
 
         actual_end = min(end_p, src_doc.page_count)
-        total_pages_in_range = actual_end - start_p + 1
+        actual_start = max(1, start_p)
 
-        if start_p < 1 or actual_end < start_p:
+        if actual_start > actual_end:
             await msg.edit_text("❌ Invalid page range.")
             PDF_QUIZ_SESSIONS.pop(uid, None)
             await remove_file(pdf_path)
             return
 
+        selected_pages = list(
+            range(actual_start, actual_end + 1)
+        )
+
+        total_pages_in_range = len(selected_pages)
+
         all_questions: list[dict] = []
+        fingerprints: set = set()
 
-        for page_idx in range(start_p - 1, actual_end):
-            page_num = page_idx + 1
-            pages_remaining = actual_end - page_idx
-            questions_remaining = total_q - len(all_questions
+        # Number of successful attempts per page.
+        page_attempts = {
+            page_num: 0 for page_num in selected_pages
+        }
 
-)
-            if questions_remaining <= 0:
-                break
+        # Track how many unique questions each page contributed.
+        page_yield = {
+            page_num: 0 for page_num in selected_pages
+        }
 
-            hint = max(
-                1,
-                (questions_remaining + pages_remaining - 1)
-                // pages_remaining,
-            )
+        # ----------------------------------------------------
+        # EXTRACTION HELPER
+        # ----------------------------------------------------
 
-            try:
-                await msg.edit_text(
-                    f"🔍 <b>Processing page {page_num}</b>\n"
-                    f"({page_num - start_p + 1}/{total_pages_in_range})\n\n"
-                    f"📋 Questions collected: "
-                    f"<b>{len(all_questions)}</b> / {total_q}\n\n"
-                    "⏳ Sending page to Gemini...",
-                    parse_mode=ParseMode.HTML,
-                )
-            except Exception:
-                pass
+        async def extract_from_page(
+            page_num: int,
+            hint: int,
+            attempt: int,
+        ) -> int:
+            if len(all_questions) >= total_q:
+                return 0
+
+            page_idx = page_num - 1
 
             page_bytes = await loop.run_in_executor(
-                None, _extract_page_bytes, src_doc, page_idx
+                None,
+                _extract_page_bytes,
+                src_doc,
+                page_idx,
             )
-            page_b64 = base64.b64encode(page_bytes).decode("utf-8")
+
+            page_b64 = base64.b64encode(
+                page_bytes
+            ).decode("utf-8")
 
             try:
-                page_questions = await gemini_page_questions(
+                result = await gemini_page_questions(
                     gemini_key,
                     page_b64,
                     page_num,
@@ -1194,28 +1283,195 @@ async def _pdfquiz_generate_flow(
                     lang,
                 )
 
-                if page_questions:
-                    all_questions.extend(page_questions)
-
-            except Exception as e:
-                logger.warning(
-                    "PDF quiz page %d generation failed: %s",
-                    page_num,
-                    e,
+                added = _add_unique_questions(
+                    all_questions,
+                    result,
+                    fingerprints,
                 )
+
+                page_yield[page_num] += added
+
+                logger.info(
+                    "PDF quiz page %d attempt %d: "
+                    "%d returned, %d unique added, total %d/%d",
+                    page_num,
+                    attempt,
+                    len(result) if isinstance(result, list) else 0,
+                    added,
+                    len(all_questions),
+                    total_q,
+                )
+
+                return added
+
+            except Exception as exc:
+                logger.warning(
+                    "PDF quiz page %d attempt %d failed: %s",
+                    page_num,
+                    attempt,
+                    exc,
+                    exc_info=True,
+                )
+                return 0
+
+        # ----------------------------------------------------
+        # PASS 1 — PROCESS ALL SELECTED PAGES
+        # ----------------------------------------------------
+
+        for position, page_num in enumerate(selected_pages, start=1):
+            if len(all_questions) >= total_q:
+                break
+
+            pages_remaining = (
+                total_pages_in_range - position + 1
+            )
+
+            questions_remaining = (
+                total_q - len(all_questions)
+            )
+
+            hint = max(
+                1,
+                (questions_remaining + pages_remaining - 1)
+                // pages_remaining,
+            )
+
+            try:
+                await msg.edit_text(
+                    "🔍 <b>PDF QUESTION EXTRACTION</b>\n\n"
+                    f"📄 Processing page: <b>{page_num}</b>\n"
+                    f"📚 Page progress: {position}/{total_pages_in_range}\n\n"
+                    f"📋 Collected: "
+                    f"<b>{len(all_questions)}/{total_q}</b>\n"
+                    f"🎯 Requested from this page: {hint}\n\n"
+                    "⏳ Extracting questions...",
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception:
+                pass
+
+            page_attempts[page_num] += 1
+
+            await extract_from_page(
+                page_num,
+                hint,
+                page_attempts[page_num],
+            )
 
             await asyncio.sleep(0.5)
 
+        # ----------------------------------------------------
+        # RECOVERY PASSES — RETRY LOW-YIELD PAGES
+        # ----------------------------------------------------
+
+        recovery_pass = 0
+
+        while (
+            len(all_questions) < total_q
+            and recovery_pass < MAX_ATTEMPTS_PER_PAGE - 1
+        ):
+            recovery_pass += 1
+
+            eligible_pages = [
+                page_num
+                for page_num in selected_pages
+                if page_attempts[page_num] < MAX_ATTEMPTS_PER_PAGE
+            ]
+
+            if not eligible_pages:
+                break
+
+            remaining = total_q - len(all_questions)
+
+            # Give each retry page a share of the remaining target.
+            retry_hint = max(
+                1,
+                (remaining + len(eligible_pages) - 1)
+                // len(eligible_pages),
+            )
+
+            try:
+                await msg.edit_text(
+                    "🔄 <b>RECOVERING MISSED QUESTIONS</b>\n\n"
+                    f"Recovery pass: <b>{recovery_pass}/"
+                    f"{MAX_ATTEMPTS_PER_PAGE - 1}</b>\n"
+                    f"📋 Collected: "
+                    f"<b>{len(all_questions)}/{total_q}</b>\n"
+                    f"🔍 Retrying {len(eligible_pages)} page(s).\n\n"
+                    "Duplicate questions will be ignored.\n"
+                    "⏳ Please wait...",
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception:
+                pass
+
+            recovered_in_pass = 0
+
+            for position, page_num in enumerate(
+                eligible_pages,
+                start=1,
+            ):
+                if len(all_questions) >= total_q:
+                    break
+
+                page_attempts[page_num] += 1
+
+                try:
+                    await msg.edit_text(
+                        "🔄 <b>RECOVERING MISSED QUESTIONS</b>\n\n"
+                        f"Recovery pass: {recovery_pass}/"
+                        f"{MAX_ATTEMPTS_PER_PAGE - 1}\n"
+                        f"📄 Retrying page: <b>{page_num}</b>\n"
+                        f"Page progress: "
+                        f"{position}/{len(eligible_pages)}\n\n"
+                        f"📋 Collected: "
+                        f"<b>{len(all_questions)}/{total_q}</b>\n"
+                        "⏳ Searching for additional questions...",
+                        parse_mode=ParseMode.HTML,
+                    )
+                except Exception:
+                    pass
+
+                added = await extract_from_page(
+                    page_num,
+                    retry_hint,
+                    page_attempts[page_num],
+                )
+
+                recovered_in_pass += added
+
+                await asyncio.sleep(RETRY_DELAY_SECONDS)
+
+            # If a complete recovery pass found nothing new,
+            # further retries are unlikely to help.
+            if recovered_in_pass == 0:
+                logger.info(
+                    "PDF quiz recovery pass %d found no new questions. "
+                    "Stopping recovery.",
+                    recovery_pass,
+                )
+                break
+
+        # ----------------------------------------------------
+        # FINAL RESULT
+        # ----------------------------------------------------
+
         if not all_questions:
             await msg.edit_text(
-                "❌ No questions generated.\n\n"
-                "The PDF may be empty or unreadable. Try another page range."
+                "❌ No valid questions could be extracted.\n\n"
+                "The PDF may not contain readable MCQs, or the "
+                "questions may not have identifiable answer keys.\n"
+                "Try another page range or another PDF."
             )
+
             PDF_QUIZ_SESSIONS.pop(uid, None)
             await remove_file(pdf_path)
             return
 
+        # Never exceed the selected question count.
         all_questions = all_questions[:total_q]
+
+        actual_count = len(all_questions)
 
         sess["questions"] = all_questions
         sess["skipped"] = set()
@@ -1224,14 +1480,30 @@ async def _pdfquiz_generate_flow(
         sess["step"] = "review"
         sess["review_message_id"] = msg.message_id
         sess["review_chat_id"] = msg.chat_id
+        sess["requested_count"] = total_q
+        sess["generated_count"] = actual_count
 
         PDF_QUIZ_SESSIONS[uid] = sess
 
+        if actual_count >= total_q:
+            result_message = (
+                f"✅ <b>Target reached: {actual_count}/{total_q}</b>\n\n"
+            )
+        else:
+            result_message = (
+                f"⚠️ <b>Extracted {actual_count}/{total_q} questions.</b>\n\n"
+                "The selected PDF pages did not yield enough "
+                "additional unique questions after recovery attempts.\n\n"
+            )
+
         await msg.edit_text(
-            _review_text(sess, 0),
+            result_message + _review_text(sess, 0),
             parse_mode=ParseMode.HTML,
             reply_markup=_review_kb(
-                uid, 0, len(all_questions), sess["skipped"]
+                uid,
+                0,
+                len(all_questions),
+                sess["skipped"],
             ),
         )
 
@@ -1241,6 +1513,7 @@ async def _pdfquiz_generate_flow(
             e,
             exc_info=True,
         )
+
         try:
             await msg.edit_text(
                 f"❌ Generation error: {escape(str(e)[:300])}",
@@ -1248,6 +1521,7 @@ async def _pdfquiz_generate_flow(
             )
         except Exception:
             pass
+
         PDF_QUIZ_SESSIONS.pop(uid, None)
 
     finally:
