@@ -457,7 +457,7 @@ async def end_private_quiz(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE) -> None
         minutes, seconds = divmod(total_time, 60)
 
         qid = quiz_data["question_set_id"]
-        buttons = [[InlineKeyboardButton("\U0001F504 Restart", url=f"https://t.me/share/url?url=/start {qid}")]]
+        buttons = [[InlineKeyboardButton("\U0001F504 Restart", url=f"https://t.me/Quizpscbot?start={qid}")]]
 
         qname = quiz_data.get("quiz_name", "Unnamed Quiz")
         txt = (
