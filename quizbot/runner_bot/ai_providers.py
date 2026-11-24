@@ -712,6 +712,74 @@ def _pdf_text_layer_is_usable(text: str) -> bool:
     return True
 
 
+def _pdf_question_comparison_key(value: str) -> str:
+    """
+    Create a temporary comparison key.
+
+    This is used only for duplicate detection.
+    Original question text is never modified.
+    """
+
+    return re.sub(r"\s+", " ", value).strip().casefold()
+
+
+def _pdf_question_fingerprint(question: dict) -> str:
+    """Build a comparison fingerprint from question and options."""
+
+    stem = _pdf_question_comparison_key(
+        str(question.get("question", ""))
+    )
+
+    options = question.get("options", [])
+
+    if not isinstance(options, list):
+        options = []
+
+    option_keys = [
+        _pdf_question_comparison_key(str(option))
+        for option in options
+    ]
+
+    return stem + "||" + "||".join(option_keys)
+
+
+def _filter_excluded_pdf_questions(
+    questions: list[dict],
+    exclude_questions: Optional[list[str]] = None,
+) -> list[dict]:
+    """
+    Remove questions already extracted during an earlier attempt.
+
+    Only comparison keys are normalized. Stored question and option
+    text remains exactly as returned by the parser.
+    """
+
+    excluded_stems = {
+        _pdf_question_comparison_key(str(item))
+        for item in (exclude_questions or [])
+        if str(item).strip()
+    }
+
+    seen_fingerprints: set[str] = set()
+    filtered: list[dict] = []
+
+    for question in questions:
+        stem = str(question.get("question", ""))
+
+        if _pdf_question_comparison_key(stem) in excluded_stems:
+            continue
+
+        fingerprint = _pdf_question_fingerprint(question)
+
+        if not fingerprint or fingerprint in seen_fingerprints:
+            continue
+
+        seen_fingerprints.add(fingerprint)
+        filtered.append(question)
+
+    return filtered
+
+
 async def gemini_page_questions(
     api_key: str,
     page_pdf_b64: str,
@@ -720,6 +788,7 @@ async def gemini_page_questions(
     diff: str,
     exam: str,
     lang: str,
+    exclude_questions: Optional[list[str]] = None,
 ) -> list[dict]:
     """
     Extract existing MCQs from a PDF page.
@@ -730,6 +799,7 @@ async def gemini_page_questions(
     3. Ask Gemini to compare the text layer against the page.
     4. Preserve original wording and Unicode characters.
     5. Never guess unreadable text.
+    6. Exclude questions already extracted in previous attempts.
     """
 
     extracted_text = _extract_pdf_page_text(page_pdf_b64)
@@ -746,6 +816,28 @@ async def gemini_page_questions(
             "Read the original PDF page carefully."
         )
 
+    # Prepare exclusion list for this retry.
+    # The original question strings are not changed.
+    excluded: list[str] = []
+    excluded_keys: set[str] = set()
+
+    for item in exclude_questions or []:
+        if not isinstance(item, str) or not item.strip():
+            continue
+
+        key = _pdf_question_comparison_key(item)
+
+        if key not in excluded_keys:
+            excluded_keys.add(key)
+            excluded.append(item)
+
+    if excluded:
+        excluded_block = "\n".join(
+            f"- {question}" for question in excluded
+        )
+    else:
+        excluded_block = "None. This is the first extraction attempt."
+
     prompt = f"""
 You are a DOCUMENT TRANSCRIPTION AND MCQ EXTRACTION SYSTEM.
 
@@ -753,7 +845,26 @@ Extract EXISTING multiple-choice questions from the supplied
 original PDF page.
 
 PDF PAGE: {page_num}
-MAXIMUM QUESTIONS: {questions_hint}
+MAXIMUM ADDITIONAL QUESTIONS: {questions_hint}
+
+QUESTIONS ALREADY EXTRACTED FROM THIS SAME PAGE:
+
+----- BEGIN EXCLUDED QUESTIONS -----
+
+{excluded_block}
+
+----- END EXCLUDED QUESTIONS -----
+
+
+IMPORTANT DUPLICATE PREVENTION RULE:
+
+- Do NOT return any question listed in the excluded section.
+- Do NOT return the same question with slightly different wording.
+- Do NOT return an excluded question with only punctuation changes.
+- Do NOT return an excluded question with different option formatting.
+- Extract only additional questions that are visibly printed on this page.
+- The excluded list is provided only to prevent duplicate extraction.
+- Do not count excluded questions toward the requested additional count.
 
 IMPORTANT SOURCE TEXT:
 
@@ -809,10 +920,11 @@ EXTRACTION RULES:
    onto another page.
 8. Do not invent explanations.
 9. Use null for explanation unless it is printed on the page.
-10. Extract no more than {questions_hint} questions.
-11. If fewer questions are printed, return fewer.
+10. Extract no more than {questions_hint} additional questions.
+11. If fewer additional questions are printed, return fewer.
 12. Do not duplicate a question.
 13. Do not guess unreadable words or characters.
+14. Do not return any question listed in the excluded section.
 
 TEXT-LAYER VERIFICATION:
 
@@ -861,7 +973,7 @@ No markdown.
 No code fences.
 No additional commentary.
 
-Return [] if no questions can be extracted confidently.
+Return [] if no additional questions can be extracted confidently.
 
 OUTPUT: JSON ARRAY ONLY.
 """
@@ -876,7 +988,8 @@ OUTPUT: JSON ARRAY ONLY.
                     "source of truth. Use embedded text only after "
                     "checking it against the page. Never translate, "
                     "rewrite, normalize, correct or invent text. "
-                    "Never guess unclear characters. Return valid JSON only."
+                    "Never guess unclear characters. Do not repeat "
+                    "questions from the excluded list. Return valid JSON only."
                 )
             }]
         },
@@ -922,12 +1035,24 @@ OUTPUT: JSON ARRAY ONLY.
 
     raw = raw.strip()
 
-    questions = parse_ai_questions(raw)
+    parsed_questions = parse_ai_questions(raw)
+
+    # Apply local filtering as well. Do not rely only on Gemini
+    # following the duplicate-prevention instructions.
+    questions = _filter_excluded_pdf_questions(
+        parsed_questions,
+        exclude_questions,
+    )
 
     logger.info(
-        "PDF extraction page %s: text_layer=%s, extracted=%d",
+        (
+            "PDF extraction page %s: text_layer=%s, "
+            "received=%d, excluded=%d, final=%d"
+        ),
         page_num,
         text_layer_available,
+        len(parsed_questions),
+        len(parsed_questions) - len(questions),
         len(questions),
     )
 
