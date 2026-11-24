@@ -1,9 +1,10 @@
-
 """
 Advance Quiz Bot — Open Source Project
 This project was originally developed by Gagan (github.com/devgaganin).
 Reference: https://t.me/advance_quiz_bot
+
 PDF extraction updated to prioritize verbatim source text.
+Unanswered or uncertain questions are skipped.
 """
 
 from __future__ import annotations
@@ -85,6 +86,10 @@ Keep total q length ≤270 chars, each option ≤90 chars.
 [OUTPUT]"""
 
 
+# ---------------------------------------------------------------------
+# AI PROVIDER KEY MANAGEMENT
+# ---------------------------------------------------------------------
+
 async def get_provider_keys(user_id: int, provider: str) -> list[dict]:
     repo = AIKeyRepository(get_db())
     return await repo.list_for_provider(user_id, provider)
@@ -101,6 +106,10 @@ async def _mark_key(key_id: int, failed: bool) -> None:
     repo = AIKeyRepository(get_db())
     await repo.mark(key_id, failed)
 
+
+# ---------------------------------------------------------------------
+# AI PROVIDER REQUESTS
+# ---------------------------------------------------------------------
 
 async def _call_gemini(
     api_key: str, prompt: str, max_tokens: int = 4096
@@ -134,7 +143,12 @@ async def _call_gemini(
     if status != 200:
         raise RuntimeError(f"Gemini {status}: {str(data)[:300]}")
 
-    return data["candidates"][0]["content"]["parts"][0]["text"].strip()
+    try:
+        return data["candidates"][0]["content"]["parts"][0]["text"].strip()
+    except (KeyError, IndexError, TypeError, AttributeError) as exc:
+        raise RuntimeError(
+            f"Invalid Gemini response: {str(data)[:300]}"
+        ) from exc
 
 
 async def _call_groq(
@@ -169,7 +183,12 @@ async def _call_groq(
     if status != 200:
         raise RuntimeError(f"Groq {status}: {str(data)[:300]}")
 
-    return data["choices"][0]["message"]["content"].strip()
+    try:
+        return data["choices"][0]["message"]["content"].strip()
+    except (KeyError, IndexError, TypeError, AttributeError) as exc:
+        raise RuntimeError(
+            f"Invalid Groq response: {str(data)[:300]}"
+        ) from exc
 
 
 async def _call_openrouter(
@@ -204,9 +223,16 @@ async def _call_openrouter(
     )
 
     if status == 200:
-        content = data["choices"][0]["message"]["content"].strip()
+        try:
+            content = data["choices"][0]["message"]["content"].strip()
+        except (KeyError, IndexError, TypeError, AttributeError) as exc:
+            raise RuntimeError(
+                f"Invalid OpenRouter response: {str(data)[:300]}"
+            ) from exc
+
         if content and content.startswith("["):
             return content
+
         raise RuntimeError(
             f"Non-JSON response from openrouter/free: {content[:200]}"
         )
@@ -247,7 +273,12 @@ async def _call_pollinations(
     if status != 200:
         raise RuntimeError(f"Pollinations {status}: {str(data)[:300]}")
 
-    return data["choices"][0]["message"]["content"].strip()
+    try:
+        return data["choices"][0]["message"]["content"].strip()
+    except (KeyError, IndexError, TypeError, AttributeError) as exc:
+        raise RuntimeError(
+            f"Invalid Pollinations response: {str(data)[:300]}"
+        ) from exc
 
 
 async def _try_call(
@@ -255,8 +286,10 @@ async def _try_call(
 ) -> str:
     if provider == "gemini":
         return await _call_gemini(api_key, prompt, max_tokens)
+
     if provider == "groq":
         return await _call_groq(api_key, prompt, max_tokens)
+
     if provider == "openrouter":
         return await _call_openrouter(api_key, prompt, max_tokens)
 
@@ -272,18 +305,25 @@ async def ai_generate(
 
     if cached:
         try:
-            result = await _try_call(
-                cached["provider"],
-                cached["api_key"],
-                prompt,
-                max_tokens,
-            )
+            if cached["provider"] == "pollinations":
+                result = await _call_pollinations(prompt, max_tokens)
+            else:
+                result = await _try_call(
+                    cached["provider"],
+                    cached["api_key"],
+                    prompt,
+                    max_tokens,
+                )
+
             if cached.get("key_id"):
                 await _mark_key(cached["key_id"], failed=False)
+
             return result
+
         except Exception:
             if cached.get("key_id"):
                 await _mark_key(cached["key_id"], failed=True)
+
             last_working_ai.pop(user_id, None)
 
     for provider in ("gemini", "groq", "openrouter"):
@@ -294,6 +334,7 @@ async def ai_generate(
                 result = await _try_call(
                     provider, key["api_key"], prompt, max_tokens
                 )
+
                 await _mark_key(key["id"], failed=False)
 
                 last_working_ai[user_id] = {
@@ -301,6 +342,7 @@ async def ai_generate(
                     "key_id": key["id"],
                     "api_key": key["api_key"],
                 }
+
                 return result
 
             except Exception:
@@ -311,12 +353,15 @@ async def ai_generate(
             result = await _call_openrouter(
                 default_key, prompt, max_tokens
             )
+
             last_working_ai[user_id] = {
                 "provider": "openrouter",
                 "key_id": None,
                 "api_key": default_key,
             }
+
             return result
+
         except Exception:
             continue
 
@@ -332,7 +377,7 @@ async def ai_generate(
 
 
 # ---------------------------------------------------------------------
-# JSON parsing
+# JSON PARSING
 # ---------------------------------------------------------------------
 
 def _extract_json_array(raw: str) -> Optional[str]:
@@ -367,6 +412,7 @@ def _extract_json_array(raw: str) -> Optional[str]:
             depth += 1
         elif char == "]":
             depth -= 1
+
             if depth == 0:
                 return cleaned[start:pos + 1]
 
@@ -377,7 +423,8 @@ def parse_ai_questions(raw: str) -> list[dict]:
     """
     Parse AI JSON into quiz question dictionaries.
 
-    Do not normalize Unicode or rewrite extracted text.
+    Original question and option text is preserved.
+    Questions without a confirmed correct answer are skipped.
     """
 
     questions: list[dict] = []
@@ -398,7 +445,7 @@ def parse_ai_questions(raw: str) -> list[dict]:
                     explanation = obj.get("e")
 
                     if not isinstance(q, str):
-                        q = str(q)
+                        continue
 
                     if not isinstance(options_raw, list):
                         continue
@@ -410,15 +457,14 @@ def parse_ai_questions(raw: str) -> list[dict]:
                         if option is None:
                             continue
 
-                        option_text = (
-                            option if isinstance(option, str) else str(option)
-                        )
+                        if not isinstance(option, str):
+                            option = str(option)
 
-                        if option_text == "":
+                        if option == "":
                             continue
 
                         original_to_new[original_index] = len(options)
-                        options.append(option_text)
+                        options.append(option)
 
                     if q == "" or len(options) < 2:
                         continue
@@ -427,18 +473,27 @@ def parse_ai_questions(raw: str) -> list[dict]:
                         correct_raw = [correct_raw]
 
                     valid_correct = []
+                    invalid_correct = False
 
                     for index in correct_raw:
-                        if isinstance(index, bool):
-                            continue
-                        if isinstance(index, (int, float)):
-                            old_index = int(index)
-                            if old_index in original_to_new:
-                                valid_correct.append(
-                                    original_to_new[old_index]
-                                )
+                        # bool is a subclass of int in Python.
+                        # Reject bool, float, strings and other invalid indexes.
+                        if type(index) is not int:
+                            invalid_correct = True
+                            break
 
-                    if not valid_correct:
+                        if index not in original_to_new:
+                            invalid_correct = True
+                            break
+
+                        mapped_index = original_to_new[index]
+
+                        if mapped_index not in valid_correct:
+                            valid_correct.append(mapped_index)
+
+                    # Skip questions without a confirmed answer.
+                    # Also skip questions containing any invalid answer index.
+                    if invalid_correct or not valid_correct:
                         continue
 
                     correct_id = (
@@ -471,10 +526,16 @@ def parse_ai_questions(raw: str) -> list[dict]:
 
     for block in blocks:
         block = block.strip()
+
         if not block:
             continue
 
-        lines = [line.strip() for line in block.split("\n") if line.strip()]
+        lines = [
+            line.strip()
+            for line in block.split("\n")
+            if line.strip()
+        ]
+
         if len(lines) < 3:
             continue
 
@@ -489,6 +550,7 @@ def parse_ai_questions(raw: str) -> list[dict]:
                 continue
 
             is_correct = "✅" in line
+
             option = re.sub(
                 r"^[A-Da-d][.)]\s*",
                 "",
@@ -523,7 +585,7 @@ def parse_ai_questions(raw: str) -> list[dict]:
 
 
 # ---------------------------------------------------------------------
-# Topic-based quiz generation
+# TOPIC-BASED QUIZ GENERATION
 # ---------------------------------------------------------------------
 
 async def generate_in_chunks(
@@ -603,6 +665,7 @@ async def generate_in_chunks(
             raw = await ai_generate(
                 user_id, prompt, max_tokens=max_tokens
             )
+
             parsed = parse_ai_questions(raw)
 
             if len(parsed) < chunk:
@@ -618,6 +681,7 @@ async def generate_in_chunks(
                     retry_prompt,
                     max_tokens=max_tokens,
                 )
+
                 parsed_retry = parse_ai_questions(raw_retry)
 
                 if len(parsed_retry) > len(parsed):
@@ -626,8 +690,10 @@ async def generate_in_chunks(
             if parsed:
                 all_questions.extend(parsed[:chunk])
                 consecutive_failures = 0
+
             else:
                 consecutive_failures += 1
+
                 logger.error(
                     "Chunk %d empty after retry (%d/3)",
                     chunk_number,
@@ -642,6 +708,7 @@ async def generate_in_chunks(
 
         except Exception as exc:
             consecutive_failures += 1
+
             logger.error(
                 "Chunk %d exception: %s", chunk_number, exc
             )
@@ -655,7 +722,7 @@ async def generate_in_chunks(
 
 
 # ---------------------------------------------------------------------
-# PDF page question extraction — VERBATIM TEXT PRIORITY
+# PDF PAGE QUESTION EXTRACTION — VERBATIM TEXT PRIORITY
 # ---------------------------------------------------------------------
 
 def _extract_pdf_page_text(page_pdf_b64: str) -> str:
@@ -716,7 +783,7 @@ def _pdf_question_comparison_key(value: str) -> str:
     """
     Create a temporary comparison key.
 
-    This is used only for duplicate detection.
+    Used only for duplicate detection.
     Original question text is never modified.
     """
 
@@ -798,8 +865,9 @@ async def gemini_page_questions(
     2. Send the original PDF page to Gemini.
     3. Ask Gemini to compare the text layer against the page.
     4. Preserve original wording and Unicode characters.
-    5. Never guess unreadable text.
-    6. Exclude questions already extracted in previous attempts.
+    5. Never guess unreadable text or answers.
+    6. Exclude questions extracted in previous attempts.
+    7. Skip questions without a confirmed correct answer.
     """
 
     extracted_text = _extract_pdf_page_text(page_pdf_b64)
@@ -817,7 +885,6 @@ async def gemini_page_questions(
         )
 
     # Prepare exclusion list for this retry.
-    # The original question strings are not changed.
     excluded: list[str] = []
     excluded_keys: set[str] = set()
 
@@ -862,8 +929,7 @@ IMPORTANT DUPLICATE PREVENTION RULE:
 - Do NOT return the same question with slightly different wording.
 - Do NOT return an excluded question with only punctuation changes.
 - Do NOT return an excluded question with different option formatting.
-- Extract only additional questions that are visibly printed on this page.
-- The excluded list is provided only to prevent duplicate extraction.
+- Extract only additional questions visibly printed on this page.
 - Do not count excluded questions toward the requested additional count.
 
 IMPORTANT SOURCE TEXT:
@@ -936,15 +1002,19 @@ TEXT-LAYER VERIFICATION:
   contains readable characters.
 - If a word or character is unclear in both sources, do not guess.
 
-ANSWER RULES:
+ANSWER RULES — VERY IMPORTANT:
 
 - Use zero-based option indexes.
-- Include the correct answer only when clearly established
-  by the printed answer key or an unambiguous indication on the page.
-- If the answer is not printed or cannot be identified confidently,
-  return an empty array for "c".
+- Include a question ONLY if its correct answer is clearly established
+  by a printed answer key or an unambiguous indication on the page.
+- If the correct answer is not printed or cannot be identified
+  confidently, DO NOT include that question in the JSON output.
+- Never return an empty "c" array.
+- Never guess the correct answer using general knowledge.
 - Never invent an answer.
 - Never add an explanation that is not printed.
+- For multiple-correct questions, include all confirmed correct indexes.
+- If even one required correct answer is uncertain, skip that question.
 
 OUTPUT FORMAT:
 
@@ -966,14 +1036,15 @@ Return a valid JSON array only.
 
 The "q" field must contain the original question.
 The "o" field must contain the original options.
-The "c" field must contain zero-based correct option indexes.
+The "c" field must contain confirmed zero-based correct option indexes.
 The "e" field must contain the printed explanation or null.
 
 No markdown.
 No code fences.
 No additional commentary.
 
-Return [] if no additional questions can be extracted confidently.
+Return [] if no additional questions with confirmed answers
+can be extracted confidently.
 
 OUTPUT: JSON ARRAY ONLY.
 """
@@ -988,8 +1059,10 @@ OUTPUT: JSON ARRAY ONLY.
                     "source of truth. Use embedded text only after "
                     "checking it against the page. Never translate, "
                     "rewrite, normalize, correct or invent text. "
-                    "Never guess unclear characters. Do not repeat "
-                    "questions from the excluded list. Return valid JSON only."
+                    "Never guess unclear characters or correct answers. "
+                    "Skip questions without a clearly confirmed answer. "
+                    "Do not repeat questions from the excluded list. "
+                    "Return valid JSON only."
                 )
             }]
         },
