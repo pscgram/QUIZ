@@ -1168,10 +1168,13 @@ async def _pdfquiz_generate_flow(
         Process every selected page.
 
     Recovery:
-        Retry pages that produced fewer questions than expected.
-        Retry at most twice per page.
+        Retry pages up to two more times.
 
-    Duplicate questions are filtered before they enter the review.
+    Duplicate prevention:
+        Send already extracted question stems to Gemini.
+        Also filter duplicates locally.
+
+    Original question and option text are never modified.
     """
 
     pdf_path = sess["pdf_path"]
@@ -1237,15 +1240,27 @@ async def _pdfquiz_generate_flow(
         all_questions: list[dict] = []
         fingerprints: set = set()
 
-        # Number of successful attempts per page.
         page_attempts = {
             page_num: 0 for page_num in selected_pages
         }
 
-        # Track how many unique questions each page contributed.
-        page_yield = {
-            page_num: 0 for page_num in selected_pages
-        }
+        # ----------------------------------------------------
+        # GET ALREADY EXTRACTED QUESTION STEMS
+        # ----------------------------------------------------
+
+        def _get_existing_question_stems() -> list[str]:
+            stems = []
+
+            for question in all_questions:
+                if not isinstance(question, dict):
+                    continue
+
+                stem = question.get("question")
+
+                if isinstance(stem, str) and stem.strip():
+                    stems.append(stem)
+
+            return stems
 
         # ----------------------------------------------------
         # EXTRACTION HELPER
@@ -1256,6 +1271,7 @@ async def _pdfquiz_generate_flow(
             hint: int,
             attempt: int,
         ) -> int:
+
             if len(all_questions) >= total_q:
                 return 0
 
@@ -1272,6 +1288,9 @@ async def _pdfquiz_generate_flow(
                 page_bytes
             ).decode("utf-8")
 
+            # Exclude questions already extracted from every page.
+            excluded_stems = _get_existing_question_stems()
+
             try:
                 result = await gemini_page_questions(
                     gemini_key,
@@ -1281,6 +1300,7 @@ async def _pdfquiz_generate_flow(
                     diff,
                     exam,
                     lang,
+                    exclude_questions=excluded_stems,
                 )
 
                 added = _add_unique_questions(
@@ -1289,14 +1309,14 @@ async def _pdfquiz_generate_flow(
                     fingerprints,
                 )
 
-                page_yield[page_num] += added
-
                 logger.info(
                     "PDF quiz page %d attempt %d: "
-                    "%d returned, %d unique added, total %d/%d",
+                    "%d returned, %d excluded stems, "
+                    "%d unique added, total %d/%d",
                     page_num,
                     attempt,
                     len(result) if isinstance(result, list) else 0,
+                    len(excluded_stems),
                     added,
                     len(all_questions),
                     total_q,
@@ -1318,7 +1338,10 @@ async def _pdfquiz_generate_flow(
         # PASS 1 — PROCESS ALL SELECTED PAGES
         # ----------------------------------------------------
 
-        for position, page_num in enumerate(selected_pages, start=1):
+        for position, page_num in enumerate(
+            selected_pages,
+            start=1,
+        ):
             if len(all_questions) >= total_q:
                 break
 
@@ -1332,15 +1355,19 @@ async def _pdfquiz_generate_flow(
 
             hint = max(
                 1,
-                (questions_remaining + pages_remaining - 1)
-                // pages_remaining,
+                (
+                    questions_remaining
+                    + pages_remaining
+                    - 1
+                ) // pages_remaining,
             )
 
             try:
                 await msg.edit_text(
                     "🔍 <b>PDF QUESTION EXTRACTION</b>\n\n"
                     f"📄 Processing page: <b>{page_num}</b>\n"
-                    f"📚 Page progress: {position}/{total_pages_in_range}\n\n"
+                    f"📚 Page progress: "
+                    f"{position}/{total_pages_in_range}\n\n"
                     f"📋 Collected: "
                     f"<b>{len(all_questions)}/{total_q}</b>\n"
                     f"🎯 Requested from this page: {hint}\n\n"
@@ -1383,22 +1410,25 @@ async def _pdfquiz_generate_flow(
 
             remaining = total_q - len(all_questions)
 
-            # Give each retry page a share of the remaining target.
             retry_hint = max(
                 1,
-                (remaining + len(eligible_pages) - 1)
-                // len(eligible_pages),
+                (
+                    remaining
+                    + len(eligible_pages)
+                    - 1
+                ) // len(eligible_pages),
             )
 
             try:
                 await msg.edit_text(
                     "🔄 <b>RECOVERING MISSED QUESTIONS</b>\n\n"
-                    f"Recovery pass: <b>{recovery_pass}/"
+                    f"Recovery pass: "
+                    f"<b>{recovery_pass}/"
                     f"{MAX_ATTEMPTS_PER_PAGE - 1}</b>\n"
                     f"📋 Collected: "
                     f"<b>{len(all_questions)}/{total_q}</b>\n"
                     f"🔍 Retrying {len(eligible_pages)} page(s).\n\n"
-                    "Duplicate questions will be ignored.\n"
+                    "Previously extracted questions will be excluded.\n"
                     "⏳ Please wait...",
                     parse_mode=ParseMode.HTML,
                 )
@@ -1419,14 +1449,16 @@ async def _pdfquiz_generate_flow(
                 try:
                     await msg.edit_text(
                         "🔄 <b>RECOVERING MISSED QUESTIONS</b>\n\n"
-                        f"Recovery pass: {recovery_pass}/"
+                        f"Recovery pass: "
+                        f"{recovery_pass}/"
                         f"{MAX_ATTEMPTS_PER_PAGE - 1}\n"
                         f"📄 Retrying page: <b>{page_num}</b>\n"
                         f"Page progress: "
                         f"{position}/{len(eligible_pages)}\n\n"
                         f"📋 Collected: "
                         f"<b>{len(all_questions)}/{total_q}</b>\n"
-                        "⏳ Searching for additional questions...",
+                        "🔍 Searching for additional questions...\n"
+                        "⏳ Please wait...",
                         parse_mode=ParseMode.HTML,
                     )
                 except Exception:
@@ -1442,8 +1474,7 @@ async def _pdfquiz_generate_flow(
 
                 await asyncio.sleep(RETRY_DELAY_SECONDS)
 
-            # If a complete recovery pass found nothing new,
-            # further retries are unlikely to help.
+            # Stop if a complete recovery pass found nothing new.
             if recovered_in_pass == 0:
                 logger.info(
                     "PDF quiz recovery pass %d found no new questions. "
@@ -1460,7 +1491,7 @@ async def _pdfquiz_generate_flow(
             await msg.edit_text(
                 "❌ No valid questions could be extracted.\n\n"
                 "The PDF may not contain readable MCQs, or the "
-                "questions may not have identifiable answer keys.\n"
+                "questions may not have identifiable answer keys.\n\n"
                 "Try another page range or another PDF."
             )
 
@@ -1487,11 +1518,13 @@ async def _pdfquiz_generate_flow(
 
         if actual_count >= total_q:
             result_message = (
-                f"✅ <b>Target reached: {actual_count}/{total_q}</b>\n\n"
+                f"✅ <b>Target reached: "
+                f"{actual_count}/{total_q}</b>\n\n"
             )
         else:
             result_message = (
-                f"⚠️ <b>Extracted {actual_count}/{total_q} questions.</b>\n\n"
+                f"⚠️ <b>Extracted "
+                f"{actual_count}/{total_q} questions.</b>\n\n"
                 "The selected PDF pages did not yield enough "
                 "additional unique questions after recovery attempts.\n\n"
             )
