@@ -3,14 +3,19 @@ Advance Quiz Bot — Open Source Project
 This project was originally developed by Gagan (github.com/devgaganin).
 Reference: https://t.me/advance_quiz_bot
 
-PDF extraction updated to prioritize verbatim source text.
-Unanswered or uncertain questions are skipped.
+PDF extraction:
+- High-resolution PDF page rendering (400 DPI).
+- Original text and script preservation.
+- Separate visual verification pass.
+- Malayalam character preservation.
+- Uncertain questions and answers are rejected.
 """
 
 from __future__ import annotations
 
 import asyncio
 import base64
+import io
 import json
 import logging
 import re
@@ -51,6 +56,7 @@ AIQUIZ_LANG = {
     "pa": "Punjabi (ਪੰਜਾਬੀ script)",
     "ur": "Urdu (اردو script)",
     "or": "Odia/Oriya (ଓଡ଼ିଆ script)",
+    "ml": "Malayalam (മലയാളം script)",
 }
 
 AIQUIZ_LANG_UI = {
@@ -66,6 +72,7 @@ AIQUIZ_LANG_UI = {
     "pa": "🟠 Punjabi",
     "ur": "🌙 Urdu",
     "or": "🔶 Odia",
+    "ml": "🟢 Malayalam",
 }
 
 QUESTION_FORMAT = """[TASK]Generate {count} MCQ on: "{topic}"
@@ -82,7 +89,7 @@ QUESTION_FORMAT_BILINGUAL = """[TASK]Generate {count} MCQ on: "{topic}"
 [RULES]JSON array only. No prose. No markdown. Start with [ end with ]
 Each item: {{"q":"<question in {lang1_short}> / <question in {lang2_short}>","o":["<A in {lang1_short}> / <A in {lang2_short}>","<B in {lang1_short}> / <B in {lang2_short}>","<C in {lang1_short}> / <C in {lang2_short}>","<D in {lang1_short}> / <D in {lang2_short}>"],"c":[0],"e":"<exp in {lang1_short}> / <exp in {lang2_short}> or null"}}
 Use / as separator between the two languages in every text field.
-Keep total q length ≤270 chars, each option ≤90 chars.
+Keep total q length <=270 chars, each option <=90 chars.
 [OUTPUT]"""
 
 
@@ -123,7 +130,10 @@ async def _call_gemini(
                 )
             }]
         },
-        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+        "contents": [{
+            "role": "user",
+            "parts": [{"text": prompt}],
+        }],
         "generationConfig": {
             "maxOutputTokens": max_tokens,
             "temperature": 0.7,
@@ -267,7 +277,9 @@ async def _call_pollinations(
     }
 
     status, data = await request_json(
-        "POST", config.POLLINATIONS_URL, json_body=payload
+        "POST",
+        config.POLLINATIONS_URL,
+        json_body=payload,
     )
 
     if status != 200:
@@ -332,7 +344,10 @@ async def ai_generate(
         for key in keys:
             try:
                 result = await _try_call(
-                    provider, key["api_key"], prompt, max_tokens
+                    provider,
+                    key["api_key"],
+                    prompt,
+                    max_tokens,
                 )
 
                 await _mark_key(key["id"], failed=False)
@@ -423,8 +438,8 @@ def parse_ai_questions(raw: str) -> list[dict]:
     """
     Parse AI JSON into quiz question dictionaries.
 
-    Original question and option text is preserved.
-    Questions without a confirmed correct answer are skipped.
+    Original question and option strings are preserved.
+    Questions without confirmed correct answers are skipped.
     """
 
     questions: list[dict] = []
@@ -476,8 +491,6 @@ def parse_ai_questions(raw: str) -> list[dict]:
                     invalid_correct = False
 
                     for index in correct_raw:
-                        # bool is a subclass of int in Python.
-                        # Reject bool, float, strings and other invalid indexes.
                         if type(index) is not int:
                             invalid_correct = True
                             break
@@ -491,8 +504,6 @@ def parse_ai_questions(raw: str) -> list[dict]:
                         if mapped_index not in valid_correct:
                             valid_correct.append(mapped_index)
 
-                    # Skip questions without a confirmed answer.
-                    # Also skip questions containing any invalid answer index.
                     if invalid_correct or not valid_correct:
                         continue
 
@@ -701,9 +712,6 @@ async def generate_in_chunks(
                 )
 
                 if consecutive_failures >= 3:
-                    logger.error(
-                        "Three consecutive empty chunks; stopping."
-                    )
                     break
 
         except Exception as exc:
@@ -722,20 +730,27 @@ async def generate_in_chunks(
 
 
 # ---------------------------------------------------------------------
-# PDF PAGE QUESTION EXTRACTION — VERBATIM TEXT PRIORITY
+# PDF PAGE PROCESSING
 # ---------------------------------------------------------------------
+
+def _decode_pdf(page_pdf_b64: str) -> bytes:
+    """Decode a base64-encoded single-page PDF."""
+
+    try:
+        return base64.b64decode(page_pdf_b64, validate=True)
+    except Exception as exc:
+        raise ValueError("Invalid base64 PDF data") from exc
+
 
 def _extract_pdf_page_text(page_pdf_b64: str) -> str:
     """
-    Extract embedded text from a single-page PDF.
-
-    No Unicode normalization or spelling correction is performed.
+    Extract embedded text without changing its Unicode characters.
     """
 
     try:
         import fitz
 
-        pdf_bytes = base64.b64decode(page_pdf_b64)
+        pdf_bytes = _decode_pdf(page_pdf_b64)
 
         with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
             if not doc.page_count:
@@ -744,19 +759,12 @@ def _extract_pdf_page_text(page_pdf_b64: str) -> str:
             return doc[0].get_text("text", sort=True)
 
     except Exception as exc:
-        logger.warning(
-            "PDF text-layer extraction failed: %s", exc
-        )
+        logger.warning("PDF text extraction failed: %s", exc)
         return ""
 
 
 def _pdf_text_layer_is_usable(text: str) -> bool:
-    """
-    Basic quality check for embedded PDF text.
-
-    This cannot prove that a font's Unicode mapping is correct.
-    The original page must still be checked visually.
-    """
+    """Basic quality check. A usable text layer is not proof of accuracy."""
 
     if not text or len(text.strip()) < 30:
         return False
@@ -773,26 +781,62 @@ def _pdf_text_layer_is_usable(text: str) -> bool:
         or ord(ch) < 32
     )
 
-    if bad_chars / len(visible) > 0.02:
-        return False
+    return bad_chars / len(visible) <= 0.02
 
-    return True
+
+def _render_pdf_page_image(
+    page_pdf_b64: str,
+    dpi: int = 400,
+) -> tuple[str, str]:
+    """
+    Render the supplied one-page PDF at high resolution.
+
+    Returns:
+        (base64_image, mime_type)
+
+    The rendered page is used as the visual source of truth.
+    """
+
+    try:
+        import fitz
+
+        pdf_bytes = _decode_pdf(page_pdf_b64)
+
+        with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
+            if not doc.page_count:
+                raise ValueError("PDF contains no pages")
+
+            page = doc[0]
+            scale = dpi / 72.0
+
+            pix = page.get_pixmap(
+                matrix=fitz.Matrix(scale, scale),
+                alpha=False,
+                colorspace=fitz.csRGB,
+            )
+
+            image_bytes = pix.tobytes("png")
+
+        return base64.b64encode(image_bytes).decode("ascii"), "image/png"
+
+    except Exception as exc:
+        logger.exception("PDF page rendering failed")
+        raise RuntimeError(
+            f"Could not render PDF page at {dpi} DPI: {exc}"
+        ) from exc
 
 
 def _pdf_question_comparison_key(value: str) -> str:
     """
-    Create a temporary comparison key.
+    Temporary key for duplicate detection only.
 
-    Used only for duplicate detection.
-    Original question text is never modified.
+    This does not modify the original question text.
     """
 
     return re.sub(r"\s+", " ", value).strip().casefold()
 
 
 def _pdf_question_fingerprint(question: dict) -> str:
-    """Build a comparison fingerprint from question and options."""
-
     stem = _pdf_question_comparison_key(
         str(question.get("question", ""))
     )
@@ -814,12 +858,7 @@ def _filter_excluded_pdf_questions(
     questions: list[dict],
     exclude_questions: Optional[list[str]] = None,
 ) -> list[dict]:
-    """
-    Remove questions already extracted during an earlier attempt.
-
-    Only comparison keys are normalized. Stored question and option
-    text remains exactly as returned by the parser.
-    """
+    """Remove previously extracted questions and duplicates."""
 
     excluded_stems = {
         _pdf_question_comparison_key(str(item))
@@ -847,6 +886,375 @@ def _filter_excluded_pdf_questions(
     return filtered
 
 
+# ---------------------------------------------------------------------
+# GEMINI IMAGE REQUEST
+# ---------------------------------------------------------------------
+
+async def _gemini_image_request(
+    api_key: str,
+    image_b64: str,
+    mime_type: str,
+    prompt: str,
+    max_tokens: int = 8192,
+) -> str:
+    """Send a rendered PDF page image and prompt to Gemini."""
+
+    payload = {
+        "system_instruction": {
+            "parts": [{
+                "text": (
+                    "You are a precise document-reading system. "
+                    "Read the supplied page image carefully. "
+                    "Never invent, translate, rewrite or correct text. "
+                    "Preserve the original script and characters."
+                )
+            }]
+        },
+        "contents": [{
+            "role": "user",
+            "parts": [
+                {
+                    "inline_data": {
+                        "mime_type": mime_type,
+                        "data": image_b64,
+                    }
+                },
+                {"text": prompt},
+            ],
+        }],
+        "generationConfig": {
+            "maxOutputTokens": max_tokens,
+            "temperature": 0,
+        },
+    }
+
+    status, data = await request_json(
+        "POST",
+        config.GEMINI_URL,
+        json_body=payload,
+        headers={
+            "x-goog-api-key": api_key,
+            "Content-Type": "application/json",
+        },
+    )
+
+    if status != 200:
+        raise RuntimeError(
+            f"Gemini image request failed ({status}): {str(data)[:500]}"
+        )
+
+    try:
+        parts = data["candidates"][0]["content"]["parts"]
+
+        text_parts = [
+            part["text"]
+            for part in parts
+            if isinstance(part, dict) and isinstance(part.get("text"), str)
+        ]
+
+        if not text_parts:
+            raise ValueError("Gemini returned no text")
+
+        return "\n".join(text_parts).strip()
+
+    except (KeyError, IndexError, TypeError, ValueError) as exc:
+        raise RuntimeError(
+            f"Invalid Gemini image response: {str(data)[:500]}"
+        ) from exc
+
+
+# ---------------------------------------------------------------------
+# PDF EXTRACTION — FIRST PASS
+# ---------------------------------------------------------------------
+
+def _build_pdf_extraction_prompt(
+    page_num: int,
+    questions_hint: int,
+    source_text: str,
+    excluded_block: str,
+) -> str:
+
+    return f"""
+TASK: TRANSCRIBE AND EXTRACT EXISTING MCQ QUESTIONS FROM THIS PAGE.
+
+PDF PAGE: {page_num}
+MAXIMUM ADDITIONAL QUESTIONS: {questions_hint}
+
+The supplied page IMAGE is the primary source.
+The PDF text below is only a secondary reference. It may contain
+incorrect font mappings or OCR-like extraction errors.
+
+----- BEGIN EMBEDDED PDF TEXT -----
+{source_text}
+----- END EMBEDDED PDF TEXT -----
+
+----- QUESTIONS ALREADY EXTRACTED -----
+{excluded_block}
+----- END EXCLUDED QUESTIONS -----
+
+STRICT TRANSCRIPTION RULES:
+
+1. Extract only questions actually visible on this page.
+2. Do not create new questions.
+3. Do not use general knowledge to complete missing text.
+4. Preserve the exact original question wording.
+5. Preserve every option exactly as printed.
+6. Preserve option order and labels.
+7. Preserve original punctuation, numbers and symbols.
+8. Do not translate or paraphrase.
+9. Do not correct spelling or grammar.
+10. Do not normalize Unicode.
+11. Do not transliterate any language.
+12. Do not silently replace similar-looking characters.
+13. Do not invent missing options.
+14. Do not invent explanations.
+15. Do not repeat excluded questions.
+16. Extract only additional questions, up to the requested limit.
+
+MALAYALAM CHARACTER PRESERVATION:
+
+If Malayalam appears on the page:
+
+- Read the Malayalam directly from the page image.
+- Preserve the exact Malayalam characters as printed.
+- Do not convert Malayalam into English or Manglish.
+- Do not replace a word with a synonym.
+- Do not autocorrect Malayalam spelling.
+- Do not remove or alter vowel signs.
+- Do not alter chillus or conjunct characters.
+- Do not change punctuation or numerals.
+- Do not copy a corrupted character from the PDF text layer.
+- If a Malayalam character cannot be read confidently, skip that
+  question instead of guessing.
+
+OTHER INDIAN SCRIPTS:
+
+Apply the same exact-character preservation to Hindi, Bengali,
+Tamil, Telugu, Kannada, Gujarati, Marathi, Punjabi, Urdu and Odia.
+
+ANSWER RULES:
+
+- The correct answer must be established by a printed answer key
+  or an unambiguous answer indication on the page.
+- Do not answer from your own knowledge.
+- Do not guess an answer.
+- Skip a question if its correct answer is not clearly confirmed.
+- Use zero-based correct option indexes.
+- For multiple-correct questions, include all confirmed indexes.
+- Never return an empty correct-answer array.
+
+EXTRACTION:
+
+- Include the printed question number when visible.
+- Do not add a question number that is not printed.
+- If a question continues onto another page, extract only the
+  visible portion. Do not invent the missing continuation.
+- If fewer than {questions_hint} eligible questions exist, return
+  only the questions that can be read and verified.
+- Do not return excluded questions, including reworded duplicates.
+
+OUTPUT:
+
+Return valid JSON array only:
+
+[
+  {{
+    "q": "Exact original question",
+    "o": [
+      "Exact option A",
+      "Exact option B",
+      "Exact option C",
+      "Exact option D"
+    ],
+    "c": [0],
+    "e": null
+  }}
+]
+
+The q and o strings must preserve the original text.
+The c array contains confirmed zero-based correct indexes.
+The e field contains a printed explanation or null.
+
+No markdown.
+No code fences.
+No commentary.
+Return [] if no eligible questions can be extracted confidently.
+"""
+
+
+# ---------------------------------------------------------------------
+# PDF EXTRACTION — SECOND VISUAL VERIFICATION PASS
+# ---------------------------------------------------------------------
+
+def _extract_verification_indexes(raw: str) -> set[int]:
+    """
+    Read the verified candidate indexes returned by the second pass.
+
+    Expected format:
+    {"verified": [0, 2]}
+    """
+
+    cleaned = re.sub(r"```(?:json)?\s*", "", raw)
+    cleaned = cleaned.replace("```", "").strip()
+
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+
+    if start < 0 or end <= start:
+        return set()
+
+    try:
+        data = json.loads(cleaned[start:end + 1])
+    except (json.JSONDecodeError, TypeError):
+        return set()
+
+    if not isinstance(data, dict):
+        return set()
+
+    indexes = data.get("verified", [])
+
+    if not isinstance(indexes, list):
+        return set()
+
+    result = set()
+
+    for index in indexes:
+        if type(index) is int and index >= 0:
+            result.add(index)
+
+    return result
+
+
+async def _verify_pdf_questions(
+    api_key: str,
+    image_b64: str,
+    mime_type: str,
+    questions: list[dict],
+    page_num: int,
+) -> list[dict]:
+    """
+    Independently compare candidate questions against the page image.
+
+    A question is retained only when the second pass confirms:
+    - The question text matches the page.
+    - Every option matches the page.
+    - Option order is correct.
+    - The correct answer is explicitly established on the page.
+    """
+
+    if not questions:
+        return []
+
+    candidates = []
+
+    for index, question in enumerate(questions):
+        candidates.append({
+            "index": index,
+            "q": question.get("question", ""),
+            "o": question.get("options", []),
+            "c": question.get("correct_option_id"),
+        })
+
+    candidates_json = json.dumps(
+        candidates,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+    prompt = f"""
+SECOND-PASS VISUAL VERIFICATION.
+
+You are checking candidate MCQs against the supplied original
+PDF page image.
+
+PAGE NUMBER: {page_num}
+
+CANDIDATE QUESTIONS:
+{candidates_json}
+
+For each candidate, inspect the actual page image independently.
+
+A candidate can be verified ONLY when all of the following are true:
+
+1. The complete question text matches the page.
+2. Every option matches the page.
+3. No character, word, number or punctuation is changed.
+4. The original option order is correct.
+5. The correct answer is explicitly established on the page.
+6. The supplied correct option index matches that evidence.
+7. All relevant text is readable with confidence.
+
+MALAYALAM AND INDIAN LANGUAGE CHECK:
+
+- Inspect every character in the original script.
+- Pay special attention to Malayalam vowel signs, chillus,
+  conjuncts and visually similar characters.
+- Do not approve a candidate if even one important character
+  cannot be confirmed.
+- Do not autocorrect or normalize any text.
+- Do not assume the first extraction pass was correct.
+
+ANSWER CHECK:
+
+- Do not approve an answer based on general knowledge.
+- The answer must be printed or unambiguously indicated on
+  the supplied page.
+- If an answer key is absent or unclear, do not approve it.
+
+IMPORTANT:
+
+Return only the indexes of candidates that pass EVERY check.
+Do not rewrite the questions.
+Do not return corrected text.
+Do not guess.
+If none pass, return an empty list.
+
+OUTPUT JSON ONLY:
+
+{{"verified": [0, 2]}}
+"""
+
+
+    try:
+        raw = await _gemini_image_request(
+            api_key=api_key,
+            image_b64=image_b64,
+            mime_type=mime_type,
+            prompt=prompt,
+            max_tokens=2048,
+        )
+
+        verified_indexes = _extract_verification_indexes(raw)
+
+        verified_questions = [
+            question
+            for index, question in enumerate(questions)
+            if index in verified_indexes
+        ]
+
+        logger.info(
+            "PDF page %s verification: %d/%d passed",
+            page_num,
+            len(verified_questions),
+            len(questions),
+        )
+
+        return verified_questions
+
+    except Exception:
+        logger.exception(
+            "PDF page %s second-pass verification failed",
+            page_num,
+        )
+
+        # Conservative behaviour: do not publish unverified questions.
+        return []
+
+
+# ---------------------------------------------------------------------
+# MAIN PDF EXTRACTION FUNCTION
+# ---------------------------------------------------------------------
+
 async def gemini_page_questions(
     api_key: str,
     page_pdf_b64: str,
@@ -858,17 +1266,30 @@ async def gemini_page_questions(
     exclude_questions: Optional[list[str]] = None,
 ) -> list[dict]:
     """
-    Extract existing MCQs from a PDF page.
+    Extract and verify existing MCQs from a single-page PDF.
 
-    Strategy:
-    1. Extract embedded PDF text without modifying it.
-    2. Send the original PDF page to Gemini.
-    3. Ask Gemini to compare the text layer against the page.
-    4. Preserve original wording and Unicode characters.
-    5. Never guess unreadable text or answers.
-    6. Exclude questions extracted in previous attempts.
-    7. Skip questions without a confirmed correct answer.
+    Existing function signature is preserved for compatibility.
+
+    Workflow:
+    1. Extract embedded PDF text as secondary reference.
+    2. Render the page at 400 DPI.
+    3. Send the page image to Gemini.
+    4. Extract existing questions without rewriting.
+    5. Parse the candidate questions.
+    6. Remove previously extracted questions.
+    7. Run a second independent visual verification.
+    8. Return only questions that pass verification.
     """
+
+    if not api_key:
+        raise ValueError("Gemini API key is missing")
+
+    if questions_hint <= 0:
+        return []
+
+    # -------------------------------------------------------------
+    # 1. Extract embedded text as a secondary reference.
+    # -------------------------------------------------------------
 
     extracted_text = _extract_pdf_page_text(page_pdf_b64)
 
@@ -880,11 +1301,14 @@ async def gemini_page_questions(
         source_text = extracted_text
     else:
         source_text = (
-            "No reliable embedded text layer was extracted. "
-            "Read the original PDF page carefully."
+            "No reliable embedded PDF text layer is available. "
+            "Read the original page image directly."
         )
 
-    # Prepare exclusion list for this retry.
+    # -------------------------------------------------------------
+    # 2. Prepare excluded questions.
+    # -------------------------------------------------------------
+
     excluded: list[str] = []
     excluded_keys: set[str] = set()
 
@@ -903,230 +1327,104 @@ async def gemini_page_questions(
             f"- {question}" for question in excluded
         )
     else:
-        excluded_block = "None. This is the first extraction attempt."
+        excluded_block = "None. First extraction attempt."
 
-    prompt = f"""
-You are a DOCUMENT TRANSCRIPTION AND MCQ EXTRACTION SYSTEM.
+    # -------------------------------------------------------------
+    # 3. Render the original page at 400 DPI.
+    # -------------------------------------------------------------
 
-Extract EXISTING multiple-choice questions from the supplied
-original PDF page.
-
-PDF PAGE: {page_num}
-MAXIMUM ADDITIONAL QUESTIONS: {questions_hint}
-
-QUESTIONS ALREADY EXTRACTED FROM THIS SAME PAGE:
-
------ BEGIN EXCLUDED QUESTIONS -----
-
-{excluded_block}
-
------ END EXCLUDED QUESTIONS -----
-
-
-IMPORTANT DUPLICATE PREVENTION RULE:
-
-- Do NOT return any question listed in the excluded section.
-- Do NOT return the same question with slightly different wording.
-- Do NOT return an excluded question with only punctuation changes.
-- Do NOT return an excluded question with different option formatting.
-- Extract only additional questions visibly printed on this page.
-- Do not count excluded questions toward the requested additional count.
-
-IMPORTANT SOURCE TEXT:
-
-The following text was extracted directly from the PDF's embedded
-text layer. It may be accurate, or it may contain font-encoding
-errors. Compare it carefully with the original PDF page.
-
------ BEGIN PDF TEXT LAYER -----
-
-{source_text}
-
------ END PDF TEXT LAYER -----
-
-
-STRICT LANGUAGE AND CHARACTER RULES:
-
-1. Detect the original language and script from the PDF page.
-2. Preserve the original language.
-3. Never translate.
-4. Never paraphrase.
-5. Never simplify.
-6. Never correct spelling or grammar.
-7. Never normalize or transliterate Unicode characters.
-8. Never replace Malayalam characters with similar-looking characters.
-9. Preserve original punctuation, numbers and symbols.
-10. Preserve the original question and option wording.
-
-MALAYALAM PRESERVATION:
-
-If the page contains Malayalam:
-
-- Preserve every Malayalam character as printed.
-- Do not convert Malayalam into English.
-- Do not convert Malayalam into Manglish.
-- Do not replace Malayalam words with synonyms.
-- Do not silently correct spelling.
-- Do not remove or alter vowel signs, chillus, conjuncts or punctuation.
-- Compare the embedded text with the original page before using it.
-- If the embedded text contains corrupted characters, do not copy
-  those corrupted characters as if they were correct.
-- If the original character cannot be identified confidently,
-  do not guess it.
-
-EXTRACTION RULES:
-
-1. Extract only questions actually printed on this page.
-2. Do not generate new questions.
-3. Do not add questions from general knowledge.
-4. Do not invent missing options.
-5. Preserve the original option order.
-6. Include the printed question number when available.
-7. Extract only the visible part of a question that continues
-   onto another page.
-8. Do not invent explanations.
-9. Use null for explanation unless it is printed on the page.
-10. Extract no more than {questions_hint} additional questions.
-11. If fewer additional questions are printed, return fewer.
-12. Do not duplicate a question.
-13. Do not guess unreadable words or characters.
-14. Do not return any question listed in the excluded section.
-
-TEXT-LAYER VERIFICATION:
-
-- Compare the extracted PDF text with the original PDF page.
-- If the text layer agrees with the page, use its exact wording.
-- If the text layer disagrees with the page, trust only text that
-  can be read confidently from the original page.
-- Never assume that a text layer is correct merely because it
-  contains readable characters.
-- If a word or character is unclear in both sources, do not guess.
-
-ANSWER RULES — VERY IMPORTANT:
-
-- Use zero-based option indexes.
-- Include a question ONLY if its correct answer is clearly established
-  by a printed answer key or an unambiguous indication on the page.
-- If the correct answer is not printed or cannot be identified
-  confidently, DO NOT include that question in the JSON output.
-- Never return an empty "c" array.
-- Never guess the correct answer using general knowledge.
-- Never invent an answer.
-- Never add an explanation that is not printed.
-- For multiple-correct questions, include all confirmed correct indexes.
-- If even one required correct answer is uncertain, skip that question.
-
-OUTPUT FORMAT:
-
-Return a valid JSON array only.
-
-[
-  {{
-    "q": "Original question exactly as printed",
-    "o": [
-      "Original option A",
-      "Original option B",
-      "Original option C",
-      "Original option D"
-    ],
-    "c": [0],
-    "e": null
-  }}
-]
-
-The "q" field must contain the original question.
-The "o" field must contain the original options.
-The "c" field must contain confirmed zero-based correct option indexes.
-The "e" field must contain the printed explanation or null.
-
-No markdown.
-No code fences.
-No additional commentary.
-
-Return [] if no additional questions with confirmed answers
-can be extracted confidently.
-
-OUTPUT: JSON ARRAY ONLY.
-"""
-
-    payload = {
-        "system_instruction": {
-            "parts": [{
-                "text": (
-                    "You are a faithful PDF transcription and extraction "
-                    "system, not a quiz writer. Preserve original text "
-                    "and scripts. The original PDF page is the visual "
-                    "source of truth. Use embedded text only after "
-                    "checking it against the page. Never translate, "
-                    "rewrite, normalize, correct or invent text. "
-                    "Never guess unclear characters or correct answers. "
-                    "Skip questions without a clearly confirmed answer. "
-                    "Do not repeat questions from the excluded list. "
-                    "Return valid JSON only."
-                )
-            }]
-        },
-        "contents": [{
-            "role": "user",
-            "parts": [
-                {
-                    "inline_data": {
-                        "mime_type": "application/pdf",
-                        "data": page_pdf_b64,
-                    }
-                },
-                {"text": prompt},
-            ],
-        }],
-        "generationConfig": {
-            "maxOutputTokens": max(2048, questions_hint * 500),
-            "temperature": 0,
-        },
-    }
-
-    status, data = await request_json(
-        "POST",
-        config.GEMINI_URL,
-        json_body=payload,
-        headers={
-            "x-goog-api-key": api_key,
-            "Content-Type": "application/json",
-        },
+    image_b64, mime_type = _render_pdf_page_image(
+        page_pdf_b64,
+        dpi=400,
     )
 
-    if status != 200:
-        raise RuntimeError(
-            f"Gemini {status}: {str(data)[:300]}"
-        )
+    logger.info(
+        "PDF page %s rendered at 400 DPI; text_layer=%s",
+        page_num,
+        text_layer_available,
+    )
 
-    try:
-        raw = data["candidates"][0]["content"]["parts"][0]["text"]
-    except (KeyError, IndexError, TypeError) as exc:
-        raise RuntimeError(
-            f"Invalid Gemini response: {str(data)[:300]}"
-        ) from exc
+    # -------------------------------------------------------------
+    # 4. First pass: extract candidate questions.
+    # -------------------------------------------------------------
 
-    raw = raw.strip()
+    prompt = _build_pdf_extraction_prompt(
+        page_num=page_num,
+        questions_hint=questions_hint,
+        source_text=source_text,
+        excluded_block=excluded_block,
+    )
+
+    raw = await _gemini_image_request(
+        api_key=api_key,
+        image_b64=image_b64,
+        mime_type=mime_type,
+        prompt=prompt,
+        max_tokens=max(4096, questions_hint * 600),
+    )
+
+    # -------------------------------------------------------------
+    # 5. Parse candidate questions.
+    # -------------------------------------------------------------
 
     parsed_questions = parse_ai_questions(raw)
 
-    # Apply local filtering as well. Do not rely only on Gemini
-    # following the duplicate-prevention instructions.
-    questions = _filter_excluded_pdf_questions(
+    if not parsed_questions:
+        logger.info(
+            "PDF page %s: no eligible questions extracted",
+            page_num,
+        )
+        return []
+
+    # -------------------------------------------------------------
+    # 6. Apply local duplicate filtering.
+    # -------------------------------------------------------------
+
+    candidates = _filter_excluded_pdf_questions(
         parsed_questions,
+        exclude_questions,
+    )
+
+    if not candidates:
+        return []
+
+    # -------------------------------------------------------------
+    # 7. Limit candidates to the requested number.
+    # -------------------------------------------------------------
+
+    candidates = candidates[:questions_hint]
+
+    # -------------------------------------------------------------
+    # 8. Second pass: visually verify each candidate.
+    # -------------------------------------------------------------
+
+    verified = await _verify_pdf_questions(
+        api_key=api_key,
+        image_b64=image_b64,
+        mime_type=mime_type,
+        questions=candidates,
+        page_num=page_num,
+    )
+
+    # -------------------------------------------------------------
+    # 9. Final duplicate filtering.
+    # -------------------------------------------------------------
+
+    final_questions = _filter_excluded_pdf_questions(
+        verified,
         exclude_questions,
     )
 
     logger.info(
         (
-            "PDF extraction page %s: text_layer=%s, "
-            "received=%d, excluded=%d, final=%d"
+            "PDF page %s completed: text_layer=%s, "
+            "first_pass=%d, verified=%d, final=%d"
         ),
         page_num,
         text_layer_available,
         len(parsed_questions),
-        len(parsed_questions) - len(questions),
-        len(questions),
+        len(verified),
+        len(final_questions),
     )
 
-    return questions
+    return final_questions
