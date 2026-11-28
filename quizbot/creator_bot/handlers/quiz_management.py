@@ -4,6 +4,12 @@ Advance Quiz Bot — Open Source Project
 This project was originally developed by Gagan (github.com/devgaganin).
 Reference: https://t.me/advance_quiz_bot
 The codebase has been reviewed and verified with the assistance of Claude AI.
+
+PSCGram additions:
+- Quiz leaderboard
+- Unique participant list
+- Participant attempt count and best score
+- Participant pagination
 """
 
 from __future__ import annotations
@@ -29,9 +35,101 @@ from ..subscribe_gate import subscribe_gate
 
 logger = logging.getLogger(__name__)
 
+PARTICIPANTS_PER_PAGE = 5
+LEADERBOARD_LIMIT = 10
+
 
 def _is_owner_or_admin(user_id: int) -> bool:
     return user_id == config.OWNER_ID or user_id in config.ADMIN_IDS
+
+
+def _safe_name(value, fallback="Unknown") -> str:
+    """Keep user-provided names safe and readable in Telegram messages."""
+    name = str(value or fallback)
+    name = " ".join(name.replace("\n", " ").replace("\r", " ").split())
+    return name[:60] or fallback
+
+
+def _format_score(value) -> str:
+    try:
+        number = float(value or 0)
+        return f"{number:.2f}".rstrip("0").rstrip(".")
+    except (TypeError, ValueError):
+        return str(value or 0)
+
+
+def _format_date(value) -> str:
+    if not value:
+        return "Unknown"
+    return str(value).replace("T", " ")[:19]
+
+
+def _normalise_options(value) -> set[str]:
+    if value is None:
+        return set()
+
+    if not isinstance(value, (list, tuple, set)):
+        value = [value]
+
+    return {str(item) for item in value}
+
+
+def _answer_stats(answers: dict, questions: list[dict]):
+    """
+    Calculate correct/wrong answers from the stored answer map.
+
+    Returns None when the source question does not contain a usable
+    correct_option_id/correct_option field.
+    """
+    if not isinstance(answers, dict):
+        return None
+
+    correct = 0
+    wrong = 0
+    checked = 0
+
+    for key, selected in answers.items():
+        try:
+            q_index = int(str(key).lstrip("q"))
+        except (TypeError, ValueError):
+            continue
+
+        if q_index < 0 or q_index >= len(questions):
+            continue
+
+        question = questions[q_index]
+        correct_value = question.get(
+            "correct_option_id",
+            question.get("correct_option"),
+        )
+
+        if correct_value is None:
+            continue
+
+        selected_set = _normalise_options(selected)
+        correct_set = _normalise_options(correct_value)
+
+        if not selected_set:
+            continue
+
+        checked += 1
+
+        if selected_set == correct_set:
+            correct += 1
+        else:
+            wrong += 1
+
+    if checked == 0:
+        return None
+
+    accuracy = (correct / checked) * 100
+
+    return {
+        "correct": correct,
+        "wrong": wrong,
+        "answered": checked,
+        "accuracy": accuracy,
+    }
 
 
 async def _send_quiz_page(
@@ -106,13 +204,329 @@ async def _send_quiz_page(
     )
 
 
+async def _get_leaderboard(qid: str) -> list[dict]:
+    """Read saved first-completion leaderboard entries."""
+    db = get_db()
+    cursor = db.collection("leaderboard").find({"qid": qid})
+
+    rows = [row async for row in cursor]
+
+    # Rank by score. For equal scores, earlier completion comes first.
+    rows.sort(
+        key=lambda row: (
+            -float(row.get("score", 0) or 0),
+            str(row.get("completed_at", "")),
+        )
+    )
+
+    return rows
+
+
+async def _send_leaderboard(
+    target,
+    qid: str,
+    uid: int,
+    quiz: dict,
+) -> None:
+    """Display the top 10 saved leaderboard entries."""
+
+    rows = await _get_leaderboard(qid)
+
+    quiz_name = _safe_name(quiz.get("quiz_name"), "Quiz")
+
+    if not rows:
+        text = (
+            f"🏆 **Leaderboard**\n\n"
+            f"📚 **{quiz_name}**\n\n"
+            "No completed quiz attempts have been recorded yet."
+        )
+
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(
+                    "⬅️ Back",
+                    callback_data=f"myq_select:{qid}:{uid}",
+                )
+            ]
+        ])
+
+        await target.edit_text(text, reply_markup=keyboard)
+        return
+
+    lines = [
+        "🏆 **LEADERBOARD**",
+        "",
+        f"📚 **{quiz_name}**",
+        f"👥 Recorded players: **{len(rows)}**",
+        "",
+    ]
+
+    medals = ["🥇", "🥈", "🥉"]
+
+    for index, row in enumerate(rows[:LEADERBOARD_LIMIT]):
+        name = _safe_name(
+            row.get("user_name") or row.get("username"),
+            f"Player {row.get('user_id', '')}",
+        )
+
+        medal = medals[index] if index < 3 else f"{index + 1}."
+
+        score = _format_score(row.get("score", 0))
+        total = row.get("total_questions", 0)
+
+        lines.append(
+            f"{medal} **{name}**\n"
+            f"   🎯 Score: **{score}** / {total}\n"
+            f"   🆔 ID: `{row.get('user_id', 'N/A')}`"
+        )
+
+        if index != min(len(rows), LEADERBOARD_LIMIT) - 1:
+            lines.append("")
+
+    if len(rows) > LEADERBOARD_LIMIT:
+        lines.extend([
+            "",
+            f"_Showing top {LEADERBOARD_LIMIT} players._",
+        ])
+
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "👥 View Participants",
+                callback_data=f"myq_participants:{qid}:{uid}:0",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "⬅️ Back",
+                callback_data=f"myq_select:{qid}:{uid}",
+            )
+        ],
+    ])
+
+    await target.edit_text(
+        "\n".join(lines),
+        reply_markup=keyboard,
+    )
+
+
+async def _get_participants(qid: str, questions: list[dict]) -> list[dict]:
+    """
+    Load completed attempts and group them by unique Telegram user ID.
+
+    Each participant receives an attempt count, best score, and latest
+    completion date. Names are taken from the leaderboard collection.
+    """
+    db = get_db()
+
+    attempt_cursor = (
+        db.collection("quiz_attempts")
+        .find({"qid": qid, "status": "completed"})
+        .sort("time_ended", -1)
+    )
+
+    attempts = [row async for row in attempt_cursor]
+
+    leaderboard_cursor = db.collection("leaderboard").find({"qid": qid})
+    leaderboard_rows = [row async for row in leaderboard_cursor]
+
+    names = {}
+
+    for row in leaderboard_rows:
+        user_id = row.get("user_id")
+        if user_id is not None:
+            names[user_id] = (
+                row.get("user_name")
+                or row.get("username")
+                or f"Player {user_id}"
+            )
+
+    grouped = {}
+
+    for attempt in attempts:
+        user_id = attempt.get("user_id")
+
+        if user_id is None:
+            continue
+
+        if user_id not in grouped:
+            grouped[user_id] = {
+                "user_id": user_id,
+                "name": _safe_name(
+                    names.get(user_id),
+                    f"Player {user_id}",
+                ),
+                "attempts": 0,
+                "best_attempt": attempt,
+                "latest_attempt": attempt,
+            }
+
+        item = grouped[user_id]
+        item["attempts"] += 1
+
+        current_score = float(attempt.get("score", 0) or 0)
+        best_score = float(
+            item["best_attempt"].get("score", 0) or 0
+        )
+
+        if current_score > best_score:
+            item["best_attempt"] = attempt
+
+    participants = list(grouped.values())
+
+    for item in participants:
+        best = item["best_attempt"]
+        stats = _answer_stats(
+            best.get("answers", {}),
+            questions,
+        )
+
+        item["best_score"] = best.get("score", 0)
+        item["total_questions"] = best.get("total_questions", 0)
+        item["played_at"] = item["latest_attempt"].get("time_ended")
+        item["answer_stats"] = stats
+
+    participants.sort(
+        key=lambda item: (
+            -float(item.get("best_score", 0) or 0),
+            _safe_name(item.get("name")).lower(),
+        )
+    )
+
+    return participants
+
+
+async def _send_participants_page(
+    target,
+    qid: str,
+    uid: int,
+    page: int,
+    quiz: dict,
+) -> None:
+    """Display a page of unique quiz participants."""
+
+    questions = quiz.get("questions", [])
+    participants = await _get_participants(qid, questions)
+
+    quiz_name = _safe_name(quiz.get("quiz_name"), "Quiz")
+    total = len(participants)
+
+    if total == 0:
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(
+                    "⬅️ Back",
+                    callback_data=f"myq_select:{qid}:{uid}",
+                )
+            ]
+        ])
+
+        await target.edit_text(
+            f"👥 **Quiz Participants**\n\n"
+            f"📚 **{quiz_name}**\n\n"
+            "No completed participants found yet.",
+            reply_markup=keyboard,
+        )
+        return
+
+    total_pages = (
+        total + PARTICIPANTS_PER_PAGE - 1
+    ) // PARTICIPANTS_PER_PAGE
+
+    page = max(0, min(page, total_pages - 1))
+
+    start = page * PARTICIPANTS_PER_PAGE
+    chunk = participants[start:start + PARTICIPANTS_PER_PAGE]
+
+    lines = [
+        "👥 **QUIZ PARTICIPANTS**",
+        "",
+        f"📚 **{quiz_name}**",
+        f"👤 Unique participants: **{total}**",
+        f"📄 Page: **{page + 1}/{total_pages}**",
+        "",
+    ]
+
+    for index, participant in enumerate(chunk, start=start + 1):
+        name = _safe_name(participant.get("name"))
+        user_id = participant.get("user_id")
+        score = _format_score(participant.get("best_score"))
+        attempts = participant.get("attempts", 0)
+        total_questions = participant.get("total_questions", 0)
+
+        lines.append(
+            f"**{index}. {name}**\n"
+            f"🆔 ID: `{user_id}`\n"
+            f"🔁 Attempts: **{attempts}**\n"
+            f"🏆 Best score: **{score}** / {total_questions}"
+        )
+
+        stats = participant.get("answer_stats")
+
+        if stats:
+            lines.append(
+                f"✅ Correct: {stats['correct']}  "
+                f"❌ Wrong: {stats['wrong']}\n"
+                f"🎯 Accuracy: **{stats['accuracy']:.1f}%**"
+            )
+
+        lines.append(
+            f"🕒 Last played: {_format_date(participant.get('played_at'))}"
+        )
+        lines.append("")
+
+    buttons = []
+    nav = []
+
+    if page > 0:
+        nav.append(
+            InlineKeyboardButton(
+                "⬅️ Previous",
+                callback_data=f"myq_participants:{qid}:{uid}:{page - 1}",
+            )
+        )
+
+    if page + 1 < total_pages:
+        nav.append(
+            InlineKeyboardButton(
+                "Next ➡️",
+                callback_data=f"myq_participants:{qid}:{uid}:{page + 1}",
+            )
+        )
+
+    if nav:
+        buttons.append(nav)
+
+    buttons.append([
+        InlineKeyboardButton(
+            "🏆 Leaderboard",
+            callback_data=f"myq_leaderboard:{qid}:{uid}",
+        )
+    ])
+
+    buttons.append([
+        InlineKeyboardButton(
+            "⬅️ Back to Quiz",
+            callback_data=f"myq_select:{qid}:{uid}",
+        )
+    ])
+
+    await target.edit_text(
+        "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+
 async def quiz_selection_cb(c: Client, cb: CallbackQuery) -> None:
-    """Handle quiz selection and its Play/Edit/Delete actions."""
+    """Handle quiz selection, leaderboard, participants and management."""
 
     try:
-        action, qid, owner_text = cb.data.split(":", 2)
-        owner_id = int(owner_text)
-    except (ValueError, AttributeError):
+        parts = cb.data.split(":")
+        action = parts[0]
+        qid = parts[1]
+        owner_id = int(parts[2])
+        page = int(parts[3]) if len(parts) > 3 else 0
+    except (ValueError, IndexError, AttributeError):
         await cb.answer("Invalid selection.", show_alert=True)
         return
 
@@ -158,6 +572,18 @@ async def quiz_selection_cb(c: Client, cb: CallbackQuery) -> None:
             ],
             [
                 InlineKeyboardButton(
+                    "🏆 Leaderboard",
+                    callback_data=f"myq_leaderboard:{qid}:{uid}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "👥 View Participants",
+                    callback_data=f"myq_participants:{qid}:{uid}:0",
+                )
+            ],
+            [
+                InlineKeyboardButton(
                     "✏️ Edit Quiz",
                     callback_data=f"myq_edit:{qid}:{uid}",
                 ),
@@ -177,6 +603,27 @@ async def quiz_selection_cb(c: Client, cb: CallbackQuery) -> None:
         await cb.message.edit_text(
             text,
             reply_markup=keyboard,
+        )
+        await cb.answer()
+        return
+
+    if action == "myq_leaderboard":
+        await _send_leaderboard(
+            cb.message,
+            qid,
+            uid,
+            quiz,
+        )
+        await cb.answer()
+        return
+
+    if action == "myq_participants":
+        await _send_participants_page(
+            cb.message,
+            qid,
+            uid,
+            page,
+            quiz,
         )
         await cb.answer()
         return
@@ -799,7 +1246,9 @@ def register(app: Client) -> None:
     )(pagination_cb)
 
     app.on_callback_query(
-        filters.regex(r"^myq_(select|edit|delete|confirm|back):")
+        filters.regex(
+            r"^myq_(select|edit|delete|confirm|back|leaderboard|participants):"
+        )
     )(quiz_selection_cb)
 
     app.on_message(
