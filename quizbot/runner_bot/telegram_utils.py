@@ -1,3 +1,4 @@
+
 """
 Advance Quiz Bot — Open Source Project
 This project was originally developed by Gagan (github.com/devgaganin).
@@ -13,11 +14,17 @@ import random
 from typing import Any, Optional
 
 from telegram.error import BadRequest, NetworkError, RetryAfter, TelegramError, TimedOut
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 
 from .state import pending_quiz_settings, session_mgr
 
 logger = logging.getLogger(__name__)
+
+# PSCGram channel Join button attached to every quiz poll.
+PSCGRAM_JOIN_BUTTON = InlineKeyboardMarkup([
+    [InlineKeyboardButton("📢 Join: @psc_gram", url="https://t.me/psc_gram")]
+])
 
 # Telegram API hard limits.
 TG_QUESTION_MAX = 295
@@ -91,14 +98,24 @@ async def safe_send_message(
 async def safe_send_poll(
     ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, question: str, options: list[str], **kwargs: Any
 ) -> Optional[Any]:
-    """Send a poll with retry on flood-control/timeout/network errors."""
+    """Send a poll with the PSCGram Join button and retry on network errors."""
+
     if "message_thread_id" not in kwargs:
         tid = _get_topic_thread_id(chat_id)
         if tid:
             kwargs["message_thread_id"] = tid
+
+    # Attach the Join button to the same Telegram poll message.
+    kwargs["reply_markup"] = PSCGRAM_JOIN_BUTTON
+
     for attempt in range(MAX_RETRIES):
         try:
-            return await ctx.bot.send_poll(chat_id=chat_id, question=question, options=options, **kwargs)
+            return await ctx.bot.send_poll(
+                chat_id=chat_id,
+                question=question,
+                options=options,
+                **kwargs
+            )
         except RetryAfter as e:
             await asyncio.sleep(e.retry_after + random.uniform(1.0, 3.0))
         except TimedOut:
@@ -119,6 +136,7 @@ async def safe_send_poll(
         except Exception as e:
             logger.error("Unexpected poll error: %s", e)
             return None
+
     logger.error("Failed to send poll to %s after %d retries", chat_id, MAX_RETRIES)
     return None
 
